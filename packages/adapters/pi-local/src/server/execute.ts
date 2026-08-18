@@ -80,6 +80,42 @@ function parseModelId(model: string | null): string | null {
   return trimmed.slice(trimmed.indexOf("/") + 1).trim() || null;
 }
 
+/**
+ * pi surfaces the provider's own error text, so classify it into the SAME
+ * families claude-local and codex-local already emit. Without this, a pi run
+ * that 429s on every turn still exits 0 and is recorded as `succeeded` - which
+ * is how nine agents looked healthy for hours on 2026-08-17 while doing nothing.
+ *
+ * `provider_quota` - the lane is out of budget/quota or its credential is gone.
+ * Retrying the same model cannot help; only waiting for the reset window or
+ * moving to another model can.
+ *
+ * Real strings this matches:
+ *   "You exceeded your current quota" / RESOURCE_EXHAUSTED / limit: 20  (google)
+ *   "OAuth session expired and could not be refreshed"                 (anthropic)
+ *   "You've hit your session limit \u00b7 resets 12:10am (UTC)"             (claude max)
+ */
+const PI_PROVIDER_QUOTA_PATTERNS = [
+  /RESOURCE_EXHAUSTED/i,
+  /exceeded your current quota/i,
+  /quota exceeded/i,
+  /rate.?limit/i,
+  /session limit/i,
+  /OAuth session expired/i,
+  /could not be refreshed/i,
+  /failed to authenticate/i,
+  /\b429\b/,
+];
+
+export function isPiProviderQuotaError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = `${input.errorMessage ?? ""}\n${input.stderr ?? ""}\n${input.stdout ?? ""}`;
+  return PI_PROVIDER_QUOTA_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
 async function ensurePiSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
@@ -226,7 +262,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "pi");
-  const model = asString(config.model, "").trim();
+  // Set by the heartbeat retry scheduler when the previous attempt died on a dead
+  // lane. It overrides the configured model for THIS RUN ONLY - the agent's stored
+  // adapterConfig is never mutated, so a deliberate lane pin survives and one
+  // healthy retry cannot silently re-home the agent.
+  const laneFailoverModel = asString(context.laneFailoverModel, "").trim();
+  const model = laneFailoverModel || asString(config.model, "").trim();
   const thinking = asString(config.thinking, "").trim();
 
   // Parse model into provider and model id
@@ -767,12 +808,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
       const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
       const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+      const failed = (effectiveExitCode ?? 0) !== 0;
+      const providerQuota =
+        failed &&
+        isPiProviderQuotaError({
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
 
       return {
         exitCode: effectiveExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorMessage: failed ? fallbackErrorMessage : null,
+        errorCode: providerQuota ? "provider_quota" : null,
+        errorFamily: providerQuota ? ("provider_quota" as const) : null,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -789,6 +840,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          ...(providerQuota ? { errorFamily: "provider_quota" } : {}),
         },
         summary: attempt.parsed.finalMessage ?? attempt.parsed.messages.join("\n\n").trim(),
         clearSession: Boolean(clearSessionOnMissingSession),

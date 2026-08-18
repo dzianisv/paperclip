@@ -318,6 +318,12 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import {
+  computeLaneFailoverExhaustedDelayMs,
+  isLaneFailoverExhausted,
+  resolveLaneFailoverModel,
+  LANE_FAILOVER_SWITCH_DELAY_MS,
+} from "./lane-failover.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -596,6 +602,7 @@ function readTransientRecoveryContractFromRun(
       }
     : null;
 }
+
 
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
   const context = parseObject(contextSnapshot);
@@ -11120,7 +11127,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent.adapterType === "codex_local" && transientRecovery?.errorFamily === "transient_upstream"
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
-    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    // A spent lane cannot be revived by waiting, so if the agent declares
+    // `failoverModels` we move the retry onto the next model instead.
+    const laneFailoverModel =
+      transientRecovery?.errorFamily === "provider_quota"
+        ? resolveLaneFailoverModel(agent.adapterConfig, nextAttempt)
+        : null;
+    // Every declared lane has now been tried and failed. Waiting is all that is
+    // left, but bound it to 30m rather than the generic ladder's 2h, because a
+    // provider quota window usually reopens in minutes.
+    const laneFailoverExhausted =
+      transientRecovery?.errorFamily === "provider_quota" &&
+      isLaneFailoverExhausted(agent.adapterConfig, nextAttempt);
+    // Switching lane makes the quota reset window irrelevant: the retry is going
+    // to a DIFFERENT provider, so holding it until the old lane resets would
+    // strand the agent for the whole window for no reason. Keep the wait only
+    // when there is nowhere else to go.
+    const transientRetryNotBefore = laneFailoverModel
+      ? null
+      : transientRecovery?.retryNotBefore ?? null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
@@ -11182,14 +11207,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    const laneFailoverSchedule = laneFailoverModel
+      ? {
+          // Another lane is available, so there is nothing to wait for. Go now;
+          // a small floor keeps this off a hot loop if that lane also fails.
+          ...baseSchedule,
+          delayMs: LANE_FAILOVER_SWITCH_DELAY_MS,
+          dueAt: new Date(now.getTime() + LANE_FAILOVER_SWITCH_DELAY_MS),
+        }
+      : laneFailoverExhausted
+        ? (() => {
+            const delayMs = computeLaneFailoverExhaustedDelayMs(nextAttempt);
+            return { ...baseSchedule, delayMs, dueAt: new Date(now.getTime() + delayMs) };
+          })()
+        : baseSchedule;
+
     const schedule =
-      transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      transientRetryNotBefore && transientRetryNotBefore.getTime() > laneFailoverSchedule.dueAt.getTime()
         ? {
-            ...baseSchedule,
+            ...laneFailoverSchedule,
             dueAt: transientRetryNotBefore,
             delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
           }
-        : baseSchedule;
+        : laneFailoverSchedule;
 
     const requiresIssueGate =
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -11265,6 +11305,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
         : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+      ...(laneFailoverModel ? { laneFailoverModel } : {}),
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
     const continuationRetryIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
@@ -11497,6 +11538,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
               : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+            ...(laneFailoverModel ? { laneFailoverModel } : {}),
           }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
@@ -11717,6 +11759,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        ...(laneFailoverModel ? { laneFailoverModel } : {}),
       },
     });
 

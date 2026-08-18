@@ -155,6 +155,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     scheduledRetryAttempt?: number;
     resultJson?: Record<string, unknown> | null;
     adapterType?: string;
+    adapterConfig?: Record<string, unknown>;
     agentName?: string;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
@@ -174,7 +175,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       role: "engineer",
       status: "active",
       adapterType,
-      adapterConfig: {},
+      adapterConfig: input.adapterConfig ?? {},
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -212,6 +213,163 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       createdAt: input.now,
     });
   }
+
+  it("walks failoverModels on provider_quota and switches lane immediately instead of waiting for the reset", async () => {
+    // A dead lane cannot be revived by waiting. When the agent declares other
+    // lanes, the retry must land on the NEXT model and must NOT be held until
+    // the exhausted lane's reset window.
+    const failoverModels = ["github-copilot/claude-sonnet-5", "google/gemini-3.7-flash"];
+
+    for (const [index, expectedModel] of failoverModels.entries()) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date(`2026-04-21T1${index}:00:00.000Z`);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        // far-future reset: proves we do NOT wait for it when a lane is available
+        retryNotBefore: "2030-04-22T21:00:00.000Z",
+        adapterType: "pi_local",
+        adapterConfig: { model: "anthropic/claude-opus-5", failoverModels },
+        scheduledRetryAttempt: index,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") continue;
+
+      const retryRun = await db
+        .select({
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+
+      const snapshot = retryRun?.contextSnapshot as Record<string, unknown> | null;
+      // Per-run override: the agent's stored adapterConfig.model is untouched,
+      // so a deliberate lane pin survives.
+      expect(snapshot?.laneFailoverModel).toBe(expectedModel);
+
+      // Scheduled seconds out, not at the 2030 reset time.
+      const dueAt = retryRun?.scheduledRetryAt ? new Date(retryRun.scheduledRetryAt) : null;
+      expect(dueAt).not.toBeNull();
+      expect(dueAt!.getTime() - now.getTime()).toBeLessThan(60_000);
+
+      const wakeupRequest = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun?.wakeupRequestId ?? ""))
+        .then((rows) => rows[0] ?? null);
+      expect((wakeupRequest?.payload as Record<string, unknown> | null)?.laneFailoverModel).toBe(
+        expectedModel,
+      );
+
+      await db.delete(heartbeatRunEvents);
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      await db.delete(agents);
+      await db.delete(companies);
+    }
+  });
+
+  it("backs off exponentially, capped at 30m, once every failover lane is exhausted", async () => {
+    // attempt 2 -> 2m, attempt 3 -> 4m, attempt 4 -> 8m ... capped at 30m.
+    const cases = [
+      { priorAttempts: 1, expectedMs: 2 * 60 * 1000 },
+      { priorAttempts: 2, expectedMs: 4 * 60 * 1000 },
+      { priorAttempts: 3, expectedMs: 8 * 60 * 1000 },
+      { priorAttempts: 9, expectedMs: 30 * 60 * 1000 },
+    ];
+
+    for (const [index, { priorAttempts, expectedMs }] of cases.entries()) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date(`2026-04-23T0${index}:00:00.000Z`);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        adapterType: "pi_local",
+        // single entry, already consumed by attempt 1 -> exhausted from attempt 2 on
+        adapterConfig: { model: "anthropic/claude-opus-5", failoverModels: ["google/gemini-3.7-flash"] },
+        scheduledRetryAttempt: priorAttempts,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      if (scheduled.outcome !== "scheduled") {
+        // bounded-retry cap reached; nothing to assert for this attempt
+        await db.delete(heartbeatRunEvents);
+        await db.delete(heartbeatRuns);
+        await db.delete(agentWakeupRequests);
+        await db.delete(agents);
+        await db.delete(companies);
+        continue;
+      }
+
+      const retryRun = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+
+      // exhausted -> no model override, and the wait is the capped exponential value
+      expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.laneFailoverModel ?? null).toBeNull();
+      const dueAt = retryRun?.scheduledRetryAt ? new Date(retryRun.scheduledRetryAt) : null;
+      expect(dueAt).not.toBeNull();
+      expect(dueAt!.getTime() - now.getTime()).toBe(expectedMs);
+      expect(dueAt!.getTime() - now.getTime()).toBeLessThanOrEqual(30 * 60 * 1000);
+
+      await db.delete(heartbeatRunEvents);
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      await db.delete(agents);
+      await db.delete(companies);
+    }
+  });
+
+  it("does NOT switch lane on process_lost — a service restart is not a dead provider", async () => {
+    // Guard against the failure that would fail the whole fleet over to another
+    // provider every time paperclipai restarts (AGE-538 kills runs in-flight).
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-24T00:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "process_lost",
+      errorFamily: null,
+      adapterType: "pi_local",
+      adapterConfig: { model: "anthropic/claude-opus-5", failoverModels: ["google/gemini-3.7-flash"] },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.laneFailoverModel ?? null).toBeNull();
+  });
 
   it("records provider quota failures, schedules the reset-time retry, and leaves the agent idle", async () => {
     const companyId = randomUUID();
