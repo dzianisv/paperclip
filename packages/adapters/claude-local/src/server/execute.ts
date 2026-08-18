@@ -421,7 +421,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     config.promptTemplate,
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
-  const model = asString(config.model, "");
+  // A provider_quota retry may have been scheduled onto this adapter with a
+  // different model (adapterConfig.fallbackChain). The override is per-run and
+  // lives on the run context, never on the agent row, so the agent's configured
+  // model is untouched and a deliberate lane pin survives a failover.
+  const laneFailoverModel = asString(context.laneFailoverModel, "").trim();
+  const model = laneFailoverModel || asString(config.model, "");
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
