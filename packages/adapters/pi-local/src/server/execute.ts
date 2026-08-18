@@ -72,6 +72,38 @@ function parseModelId(model: string | null): string | null {
   return trimmed.slice(trimmed.indexOf("/") + 1).trim() || null;
 }
 
+/**
+ * A lane-dead error means THIS provider cannot serve THIS agent right now, no
+ * matter how long we wait: the credential is gone or the quota is spent.
+ * Distinguishing it from `transient_upstream` is the whole point — a transient
+ * error should retry the same lane, a dead lane must move to the next one.
+ *
+ * Matched against pi's surfaced provider error text, e.g.:
+ *   "OAuth session expired and could not be refreshed"       (claude/anthropic)
+ *   "You've hit your session limit · resets 12:10am (UTC)"    (claude max)
+ *   "RESOURCE_EXHAUSTED ... generate_content_free_tier_requests, limit: 20" (google)
+ */
+const PI_LANE_DEAD_PATTERNS = [
+  /OAuth session expired/i,
+  /could not be refreshed/i,
+  /failed to authenticate/i,
+  /session limit/i,
+  /RESOURCE_EXHAUSTED/i,
+  /exceeded your current quota/i,
+  /quota exceeded/i,
+  /\b(401|403)\b[^\n]{0,40}(unauthor|forbidden|invalid|expired)/i,
+  /\b429\b/,
+];
+
+function isPiLaneDeadError(input: {
+  stdout: string;
+  stderr: string;
+  errorMessage: string | null;
+}): boolean {
+  const haystack = `${input.errorMessage ?? ""}\n${input.stderr}\n${input.stdout}`;
+  return PI_LANE_DEAD_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
 async function ensurePiSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
@@ -156,7 +188,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "pi");
-  const model = asString(config.model, "").trim();
+  // `laneFallbackModel` is set by the heartbeat retry scheduler when the previous
+  // attempt died with errorFamily `lane_dead`. It overrides the agent's configured
+  // model for THIS RUN ONLY — the agent's stored config is never mutated, so a
+  // deliberate pin (e.g. AGE-527) survives and one healthy run does not silently
+  // re-home the agent.
+  const laneFallbackModel = asString(context.laneFallbackModel, "").trim();
+  const model = laneFallbackModel || asString(config.model, "").trim();
   const thinking = asString(config.thinking, "").trim();
 
   // Parse model into provider and model id
@@ -610,12 +648,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
     const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
     const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+    const failed = (effectiveExitCode ?? 0) !== 0;
+    const laneDead =
+      failed &&
+      isPiLaneDeadError({
+        stdout: attempt.proc.stdout,
+        stderr: attempt.proc.stderr,
+        errorMessage: fallbackErrorMessage,
+      });
 
     return {
       exitCode: effectiveExitCode,
       signal: attempt.proc.signal,
       timedOut: false,
-      errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+      errorMessage: failed ? fallbackErrorMessage : null,
+      errorCode: laneDead ? "pi_lane_dead" : null,
+      errorFamily: laneDead ? "lane_dead" : null,
       usage: {
         inputTokens: attempt.parsed.usage.inputTokens,
         outputTokens: attempt.parsed.usage.outputTokens,
@@ -632,6 +680,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resultJson: {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
+        ...(laneDead ? { errorFamily: "lane_dead" } : {}),
       },
       summary: attempt.parsed.finalMessage ?? attempt.parsed.messages.join("\n\n").trim(),
       clearSession: Boolean(clearSessionOnMissingSession),

@@ -200,6 +200,9 @@ function readHeartbeatRunErrorFamily(
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
 
+  if (run.errorCode === "pi_lane_dead" || run.errorCode === "claude_auth_required") {
+    return "lane_dead";
+  }
   if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
     return "transient_upstream";
   }
@@ -219,12 +222,41 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
+  const family = readHeartbeatRunErrorFamily(run);
+  if (family === "lane_dead") {
+    // No backoff: waiting cannot revive a dead credential or a spent quota. The
+    // retry is only worth running because it lands on a DIFFERENT model.
+    return { errorFamily: "lane_dead" as const, retryNotBefore: null };
+  }
+  return family === "transient_upstream"
     ? {
         errorFamily: "transient_upstream" as const,
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       }
     : null;
+}
+
+/**
+ * Pick the model for retry attempt N from `adapterConfig.fallbackModels`.
+ *
+ * Paperclip stores an agent's lane as two scalars (`adapterType` +
+ * `adapterConfig.model`), which is why one dead provider used to take the whole
+ * org down: nothing could express "try this other one instead". `fallbackModels`
+ * is that missing list. Attempt 1 takes fallbackModels[0], attempt 2 takes [1],
+ * and so on. When the list runs out we return null so the run fails for real
+ * instead of looping on a lane already known to be dead.
+ */
+function resolveLaneFallbackModel(
+  agent: Pick<typeof agents.$inferSelect, "adapterConfig">,
+  attempt: number,
+): string | null {
+  const config = parseObject(agent.adapterConfig);
+  const configured = Array.isArray(config.fallbackModels) ? config.fallbackModels : [];
+  const models = configured
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value) => value.length > 0);
+  if (models.length === 0) return null;
+  return models[attempt - 1] ?? null;
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -3618,6 +3650,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent.adapterType === "codex_local" && transientRecovery
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
+    // On a dead lane the retry is pointless unless it changes model, so resolve
+    // the next fallback here and carry it on the retry run.
+    const laneFallbackModel =
+      transientRecovery?.errorFamily === "lane_dead"
+        ? resolveLaneFallbackModel(agent, nextAttempt)
+        : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
 
     if (!baseSchedule) {
@@ -3661,6 +3699,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+      ...(laneFallbackModel ? { laneFallbackModel } : {}),
     };
 
     const retryRun = await db.transaction(async (tx) => {
@@ -3681,6 +3720,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             scheduledRetryAt: schedule.dueAt.toISOString(),
             ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+            ...(laneFallbackModel ? { laneFallbackModel } : {}),
           },
           status: "queued",
           requestedByActorType: "system",
@@ -3749,6 +3789,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         delayMs: schedule.delayMs,
         ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        ...(laneFallbackModel ? { laneFallbackModel } : {}),
       },
     });
 

@@ -64,7 +64,14 @@ export interface AdapterRuntimeServiceReport {
   healthStatus?: "unknown" | "healthy" | "unhealthy";
 }
 
-export type AdapterExecutionErrorFamily = "transient_upstream";
+/**
+ * `transient_upstream` — the provider is up but hiccuped; retrying the SAME lane
+ *   later is the right move.
+ * `lane_dead` — the lane itself is unusable for this agent (expired OAuth,
+ *   exhausted quota, 429/401/403). Retrying the same lane can never succeed, so
+ *   the retry must move to the next entry in `adapterConfig.fallbackModels`.
+ */
+export type AdapterExecutionErrorFamily = "transient_upstream" | "lane_dead";
 
 export interface AdapterExecutionResult {
   exitCode: number | null;

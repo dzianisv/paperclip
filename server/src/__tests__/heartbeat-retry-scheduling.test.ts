@@ -62,15 +62,22 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     agentId: string;
     now: Date;
     errorCode: string;
-    errorFamily?: "transient_upstream" | null;
+    errorFamily?: "transient_upstream" | "lane_dead" | null;
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
     resultJson?: Record<string, unknown> | null;
-    adapterType?: "codex_local" | "claude_local";
+    adapterType?: "codex_local" | "claude_local" | "pi_local";
+    adapterConfig?: Record<string, unknown>;
     agentName?: string;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
-    const agentName = input.agentName ?? (adapterType === "claude_local" ? "ClaudeCoder" : "CodexCoder");
+    const agentName =
+      input.agentName ??
+      (adapterType === "claude_local"
+        ? "ClaudeCoder"
+        : adapterType === "pi_local"
+        ? "PiCoder"
+        : "CodexCoder");
     await db.insert(companies).values({
       id: input.companyId,
       name: "Paperclip",
@@ -85,7 +92,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       role: "engineer",
       status: "active",
       adapterType,
-      adapterConfig: {},
+      adapterConfig: input.adapterConfig ?? {},
       runtimeConfig: {
         heartbeat: {
           wakeOnDemand: true,
@@ -670,6 +677,103 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
       maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
     });
+  });
+
+  it("walks fallbackModels across bounded retries when the lane is dead", async () => {
+    // A dead lane (expired OAuth, spent quota) cannot be fixed by waiting, so each
+    // retry must land on the NEXT model. Attempt 1 -> fallbackModels[0], etc.
+    const fallbackModels = ["github-copilot/claude-sonnet-5", "google/gemini-3.7-flash"];
+
+    for (const [index, expectedModel] of fallbackModels.entries()) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date(`2026-04-21T1${index}:00:00.000Z`);
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: "pi_lane_dead",
+        errorFamily: "lane_dead",
+        adapterType: "pi_local",
+        adapterConfig: { model: "anthropic/claude-opus-5", fallbackModels },
+        scheduledRetryAttempt: index,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") continue;
+
+      const retryRun = await db
+        .select({
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+
+      const snapshot = retryRun?.contextSnapshot as Record<string, unknown> | null;
+      // The adapter reads the model override off the run context, so the agent's
+      // stored adapterConfig.model is left untouched and a deliberate pin survives.
+      expect(snapshot?.laneFallbackModel).toBe(expectedModel);
+      expect(snapshot?.errorFamily).toBe("lane_dead");
+
+      const wakeupRequest = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun?.wakeupRequestId ?? ""))
+        .then((rows) => rows[0] ?? null);
+      expect((wakeupRequest?.payload as Record<string, unknown> | null)?.laneFallbackModel).toBe(
+        expectedModel,
+      );
+
+      await db.delete(heartbeatRunEvents);
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      await db.delete(agents);
+      await db.delete(companies);
+    }
+  });
+
+  it("stops overriding the model once fallbackModels is exhausted", async () => {
+    // Past the end of the list there is nowhere left to go. Emitting no override
+    // lets the run fail for real instead of looping on a lane known to be dead.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-04-21T20:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "pi_lane_dead",
+      errorFamily: "lane_dead",
+      adapterType: "pi_local",
+      adapterConfig: { model: "anthropic/claude-opus-5", fallbackModels: ["google/gemini-3.7-flash"] },
+      scheduledRetryAttempt: 1, // next attempt is 2, list only has one entry
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const retryRun = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(
+      (retryRun?.contextSnapshot as Record<string, unknown> | null)?.laneFallbackModel ?? null,
+    ).toBeNull();
   });
 
   it("advances codex transient fallback stages across bounded retry attempts", async () => {
