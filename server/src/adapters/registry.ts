@@ -578,6 +578,18 @@ export function getServerAdapter(type: string): ServerAdapterModule {
 }
 
 /**
+ * Whether an adapter type is actually registered.
+ *
+ * `getServerAdapter` falls back to the process adapter for unknown types, which
+ * is a safe default for a misconfigured agent but is wrong for a per-run lane
+ * failover override: a typo would silently execute on the process adapter
+ * instead of the intended one. Callers applying an override must check first.
+ */
+export function hasServerAdapter(type: string): boolean {
+  return findActiveServerAdapter(type) !== undefined && findActiveServerAdapter(type) !== null;
+}
+
+/**
  * Memoized view of PAPERCLIP_ADAPTER_MODELS, keyed by the raw env string so
  * tests (and live env mutation) that change the variable are still observed.
  * Parsing happens at most once per distinct raw value instead of per

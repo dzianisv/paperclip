@@ -82,7 +82,7 @@ export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, hasServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -321,7 +321,10 @@ import { serverVersion } from "../version.js";
 import {
   computeLaneFailoverExhaustedDelayMs,
   isLaneFailoverExhausted,
-  resolveLaneFailoverModel,
+  resolveEffectiveAdapterType,
+  resolveLaneFallback,
+  LANE_FAILOVER_ADAPTER_TYPE_KEY,
+  LANE_FAILOVER_MODEL_KEY,
   LANE_FAILOVER_SWITCH_DELAY_MS,
 } from "./lane-failover.js";
 
@@ -11129,9 +11132,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     // A spent lane cannot be revived by waiting, so if the agent declares
     // `failoverModels` we move the retry onto the next model instead.
-    const laneFailoverModel =
+    const laneFallback =
       transientRecovery?.errorFamily === "provider_quota"
-        ? resolveLaneFailoverModel(agent.adapterConfig, nextAttempt)
+        ? resolveLaneFallback(agent.adapterConfig, nextAttempt)
+        : null;
+    const laneFailoverModel = laneFallback?.model ?? null;
+    // null adapterType means "keep the current adapter, swap the model only".
+    const laneFailoverAdapterType =
+      laneFallback?.adapterType && laneFallback.adapterType !== agent.adapterType
+        ? laneFallback.adapterType
         : null;
     // Every declared lane has now been tried and failed. Waiting is all that is
     // left, but bound it to 30m rather than the generic ladder's 2h, because a
@@ -11305,7 +11314,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
         : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-      ...(laneFailoverModel ? { laneFailoverModel } : {}),
+      ...(laneFailoverModel ? { [LANE_FAILOVER_MODEL_KEY]: laneFailoverModel } : {}),
+      ...(laneFailoverAdapterType ? { [LANE_FAILOVER_ADAPTER_TYPE_KEY]: laneFailoverAdapterType } : {}),
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
     const continuationRetryIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
@@ -11538,7 +11548,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
               : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-            ...(laneFailoverModel ? { laneFailoverModel } : {}),
+            ...(laneFailoverModel ? { [LANE_FAILOVER_MODEL_KEY]: laneFailoverModel } : {}),
+      ...(laneFailoverAdapterType ? { [LANE_FAILOVER_ADAPTER_TYPE_KEY]: laneFailoverAdapterType } : {}),
           }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
@@ -11759,7 +11770,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-        ...(laneFailoverModel ? { laneFailoverModel } : {}),
+        ...(laneFailoverModel ? { [LANE_FAILOVER_MODEL_KEY]: laneFailoverModel } : {}),
+      ...(laneFailoverAdapterType ? { [LANE_FAILOVER_ADAPTER_TYPE_KEY]: laneFailoverAdapterType } : {}),
       },
     });
 
@@ -15435,7 +15447,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
-      const adapter = getServerAdapter(agent.adapterType);
+      // A provider_quota retry may have been scheduled onto a DIFFERENT adapter:
+      // fallbackChain entries carry an optional adapterType. The override is
+      // per-run and lives on the run context, never on the agent row, so a
+      // deliberate lane pin survives a failover.
+      const laneAdapter = resolveEffectiveAdapterType({
+        agentAdapterType: agent.adapterType,
+        contextSnapshot: run.contextSnapshot,
+        isKnownAdapterType: hasServerAdapter,
+      });
+      if (laneAdapter.rejected) {
+        logger.warn(
+          {
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runId: run.id,
+            requested: laneAdapter.rejected,
+          },
+          "lane failover requested an unknown adapter type; running on the agent's own adapter instead",
+        );
+      }
+      const effectiveAdapterType = laneAdapter.adapterType;
+      const adapter = getServerAdapter(effectiveAdapterType);
+      if (laneAdapter.overridden) {
+        await appendRunEvent(currentRun, seq++, {
+          eventType: "lane_failover",
+          stream: "system",
+          level: "warn",
+          message: `Lane failover: running on ${effectiveAdapterType} instead of ${agent.adapterType}`,
+          payload: { from: agent.adapterType, to: effectiveAdapterType },
+        });
+      }
       const localAgentJwtScope =
         issueRef?.workMode === "skill_test"
           ? { kind: "skill_test" as const, issueId: issueRef.id }
