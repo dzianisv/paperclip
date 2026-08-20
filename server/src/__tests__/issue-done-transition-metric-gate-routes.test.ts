@@ -147,4 +147,32 @@ describeEmbeddedPostgres("done transition outcome-metric gate (AGE-626)", () => 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.status).toBe("done");
   });
+
+  it("refuses done on a re-measure-titled issue with no numeric noun overlap and no pasted evidence (AGE-626 follow-up)", async () => {
+    // Mirrors AGE-447/AGE-389/AGE-149: title's own noun ("quota") is not on
+    // the quantity-target noun list, but "re-measure" alone must still gate.
+    const issueId = await createIssue(`Post-dedup quota re-measure (${randomUUID()})`);
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error.toLowerCase()).toContain("measurement");
+    expect(res.body.details).toMatchObject({
+      code: "done_transition_metric_gate",
+      reason: "missing_outcome_measurement",
+    });
+  });
+
+  it("allows done on the re-measure fixture once a before/after quota number is pasted", async () => {
+    const issueId = await createIssue(`Post-dedup quota re-measure (${randomUUID()})`);
+    const commentRes = await request(app)
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Re-measured: quota baseline was 40 concurrent, now holding at 10." });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("done");
+  });
 });

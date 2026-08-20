@@ -574,33 +574,65 @@ function issueTitleStatesQuantityTarget(title: string | null | undefined): boole
   return QUANTITY_TARGET_VERB_PATTERN.test(trimmed) && QUANTITY_TARGET_NOUN_PATTERN.test(trimmed);
 }
 
+// AGE-626 follow-up (board comment 2026-08-20): AGE-447/AGE-389/AGE-149 were
+// each titled "...re-measure" -- the entire deliverable of the ticket *was*
+// a number -- and all three closed without one, on the single worst day in
+// the sample (08-16). "re-measure/verify/confirm/audit" in a title is an
+// unambiguous promise of a measurement even when no reduce/cut/fix verb or
+// countable-noun keyword appears (e.g. "quota", not on the noun list). This
+// is a second, independent trigger for the same evidence requirement below.
+const MEASUREMENT_VERB_TITLE_PATTERN =
+  /\b(re-?measur(?:e[sd]?|ing)|measur(?:e[sd]?|ing)|verif(?:y|ies|ied|ying)|confirm(?:s|ed|ing)?|audit(?:s|ed|ing)?)\b/i;
+
+function issueTitleRequiresMeasurementEvidence(title: string | null | undefined): boolean {
+  if (typeof title !== "string") return false;
+  const trimmed = title.trim();
+  if (trimmed.length === 0) return false;
+  return MEASUREMENT_VERB_TITLE_PATTERN.test(trimmed);
+}
+
+function issueTitleRequiresOutcomeMetricEvidence(title: string | null | undefined): boolean {
+  return issueTitleStatesQuantityTarget(title) || issueTitleRequiresMeasurementEvidence(title);
+}
+
 const OUTCOME_METRIC_NUMBER_PATTERN = /\d+(?:\.\d+)?/;
 const OUTCOME_METRIC_NA_PATTERN =
   /\bn\/a\b[^\n]{0,160}?\b(no live traffic|not (?:yet )?deployed|not measured|not applicable)\b/i;
+// Evidence lines must pair a number with either a metric-noun keyword
+// ("alerts", "errors", ...) or generic measurement-context language
+// ("before"/"after"/"baseline"/"measured"/"quota") -- the wider set a
+// re-measure/verify/confirm/audit-titled ticket is likely to use, since its
+// subject noun may not be one of the quantity-target nouns above.
+const OUTCOME_METRIC_CONTEXT_PATTERN = new RegExp(
+  `${QUANTITY_TARGET_NOUN_PATTERN.source}|\\bbefore\\b|\\bafter\\b|\\bbaseline\\b|\\bquota\\b|\\bmeasured\\b|\\bmeasurement\\b|\\bresult(?:s)?\\b`,
+  "i",
+);
 
 /**
  * Whether a block of pasted text (an issue description, or any single
  * comment body) reads as a post-deploy outcome measurement: a line carrying
- * both a number and one of the metric-noun keywords ("365 alerts/day",
- * "alerts dropped to 4"), or the explicit opt-out spelling ("N/A -- no live
- * traffic yet") the ticket allows in place of a real number. This is a
- * literal, line-scoped heuristic -- same spirit as the PR gate's literal
- * GitHub-URL regex -- not a semantic parse of the comment.
+ * both a number and one of the metric-noun/measurement-context keywords
+ * ("365 alerts/day", "alerts dropped to 4", "quota before 40 after 10"), or
+ * the explicit opt-out spelling ("N/A -- no live traffic yet") the ticket
+ * allows in place of a real number. This is a literal, line-scoped
+ * heuristic -- same spirit as the PR gate's literal GitHub-URL regex -- not
+ * a semantic parse of the comment.
  */
 function textHasOutcomeMetricEvidence(text: string | null | undefined): boolean {
   if (typeof text !== "string" || text.length === 0) return false;
   for (const line of text.split(/\r?\n/)) {
-    if (OUTCOME_METRIC_NUMBER_PATTERN.test(line) && QUANTITY_TARGET_NOUN_PATTERN.test(line)) return true;
+    if (OUTCOME_METRIC_NUMBER_PATTERN.test(line) && OUTCOME_METRIC_CONTEXT_PATTERN.test(line)) return true;
   }
   return OUTCOME_METRIC_NA_PATTERN.test(text);
 }
 
 /**
  * Fail-closed guard for the `done` transition (AGE-626): when an issue's own
- * (effective) title states a quantity/rate target, block `done` unless a
- * pasted post-deploy measurement of that same metric exists somewhere in the
- * issue's description or comment thread. Independent of, and does not
- * substitute for, AGE-569's PR-merge/CI gate -- both must pass.
+ * (effective) title states a quantity/rate target, OR promises a
+ * measurement outright (re-measure/verify/confirm/audit), block `done`
+ * unless a pasted post-deploy measurement of that same metric exists
+ * somewhere in the issue's description or comment thread. Independent of,
+ * and does not substitute for, AGE-569's PR-merge/CI gate -- both must pass.
  */
 async function assertOutcomeMetricEvidenceForQuantityTargetTitle(
   db: Db,
@@ -608,7 +640,7 @@ async function assertOutcomeMetricEvidenceForQuantityTargetTitle(
   effectiveTitle: string | null,
   effectiveDescription: string | null,
 ) {
-  if (!issueTitleStatesQuantityTarget(effectiveTitle)) return;
+  if (!issueTitleRequiresOutcomeMetricEvidence(effectiveTitle)) return;
   if (textHasOutcomeMetricEvidence(effectiveDescription)) return;
   const rows = await db
     .select({ body: issueComments.body })
@@ -618,7 +650,7 @@ async function assertOutcomeMetricEvidenceForQuantityTargetTitle(
     if (textHasOutcomeMetricEvidence(row.body)) return;
   }
   throw unprocessable(
-    "Cannot mark issue done: this issue's title states a quantity/rate target, but no post-deploy measurement of that metric was found in the description or comments. Paste a before/after number (e.g. \"alerts/day: 365 -> 4\"), or an explicit \"N/A -- no live traffic yet\" note with a name/date.",
+    "Cannot mark issue done: this issue's title states a quantity/rate target or promises a measurement (re-measure/verify/confirm/audit), but no post-deploy measurement of that metric was found in the description or comments. Paste a before/after number (e.g. \"alerts/day: 365 -> 4\"), or an explicit \"N/A -- no live traffic yet\" note with a name/date.",
     { code: "done_transition_metric_gate", reason: "missing_outcome_measurement" },
   );
 }
