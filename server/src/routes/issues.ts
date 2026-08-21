@@ -556,6 +556,105 @@ async function assertNoBlockingLinkedPullRequest(
   }
 }
 
+// AGE-626: independent close-gate for issues whose own title asserts a
+// quantity/rate target (reduce/cut/stop/fix/eliminate + a countable noun --
+// alerts, errors, spend, latency, %, volume language). Extends AGE-569's
+// mechanism gate (PR merged + CI green) with an *outcome* gate: satisfying
+// the PR gate does not by itself satisfy this one, and vice versa -- both
+// checks are independent and both must pass before `done` is allowed.
+const QUANTITY_TARGET_VERB_PATTERN =
+  /\b(reduce[sd]?|reducing|cut(?:s|ting)?|stop(?:s|ped|ping)?|fix(?:e[sd]|ing)?|eliminat(?:e[sd]?|ing)|drop(?:s|ped|ping)?|lower(?:s|ed|ing)?|decreas(?:e[sd]?|ing)|halv(?:e[sd]?|ing)?)\b/i;
+const QUANTITY_TARGET_NOUN_PATTERN =
+  /(\balerts?\b|\berrors?\b|\bspend\b|\bcosts?\b|\blatenc(?:y|ies)\b|\bnoise\b|\bvolume\b|\brate\b|\bcounts?\b|\bincidents?\b|\bfailures?\b|\bduplicates?\b|\bnotifications?\b|\bpages?\b|%|\bpercent\b)/i;
+
+function issueTitleStatesQuantityTarget(title: string | null | undefined): boolean {
+  if (typeof title !== "string") return false;
+  const trimmed = title.trim();
+  if (trimmed.length === 0) return false;
+  return QUANTITY_TARGET_VERB_PATTERN.test(trimmed) && QUANTITY_TARGET_NOUN_PATTERN.test(trimmed);
+}
+
+// AGE-626 follow-up (board comment 2026-08-20): AGE-447/AGE-389/AGE-149 were
+// each titled "...re-measure" -- the entire deliverable of the ticket *was*
+// a number -- and all three closed without one, on the single worst day in
+// the sample (08-16). "re-measure/verify/confirm/audit" in a title is an
+// unambiguous promise of a measurement even when no reduce/cut/fix verb or
+// countable-noun keyword appears (e.g. "quota", not on the noun list). This
+// is a second, independent trigger for the same evidence requirement below.
+const MEASUREMENT_VERB_TITLE_PATTERN =
+  /\b(re-?measur(?:e[sd]?|ing)|measur(?:e[sd]?|ing)|verif(?:y|ies|ied|ying)|confirm(?:s|ed|ing)?|audit(?:s|ed|ing)?)\b/i;
+
+function issueTitleRequiresMeasurementEvidence(title: string | null | undefined): boolean {
+  if (typeof title !== "string") return false;
+  const trimmed = title.trim();
+  if (trimmed.length === 0) return false;
+  return MEASUREMENT_VERB_TITLE_PATTERN.test(trimmed);
+}
+
+function issueTitleRequiresOutcomeMetricEvidence(title: string | null | undefined): boolean {
+  return issueTitleStatesQuantityTarget(title) || issueTitleRequiresMeasurementEvidence(title);
+}
+
+const OUTCOME_METRIC_NUMBER_PATTERN = /\d+(?:\.\d+)?/;
+const OUTCOME_METRIC_NA_PATTERN =
+  /\bn\/a\b[^\n]{0,160}?\b(no live traffic|not (?:yet )?deployed|not measured|not applicable)\b/i;
+// Evidence lines must pair a number with either a metric-noun keyword
+// ("alerts", "errors", ...) or generic measurement-context language
+// ("before"/"after"/"baseline"/"measured"/"quota") -- the wider set a
+// re-measure/verify/confirm/audit-titled ticket is likely to use, since its
+// subject noun may not be one of the quantity-target nouns above.
+const OUTCOME_METRIC_CONTEXT_PATTERN = new RegExp(
+  `${QUANTITY_TARGET_NOUN_PATTERN.source}|\\bbefore\\b|\\bafter\\b|\\bbaseline\\b|\\bquota\\b|\\bmeasured\\b|\\bmeasurement\\b|\\bresult(?:s)?\\b`,
+  "i",
+);
+
+/**
+ * Whether a block of pasted text (an issue description, or any single
+ * comment body) reads as a post-deploy outcome measurement: a line carrying
+ * both a number and one of the metric-noun/measurement-context keywords
+ * ("365 alerts/day", "alerts dropped to 4", "quota before 40 after 10"), or
+ * the explicit opt-out spelling ("N/A -- no live traffic yet") the ticket
+ * allows in place of a real number. This is a literal, line-scoped
+ * heuristic -- same spirit as the PR gate's literal GitHub-URL regex -- not
+ * a semantic parse of the comment.
+ */
+function textHasOutcomeMetricEvidence(text: string | null | undefined): boolean {
+  if (typeof text !== "string" || text.length === 0) return false;
+  for (const line of text.split(/\r?\n/)) {
+    if (OUTCOME_METRIC_NUMBER_PATTERN.test(line) && OUTCOME_METRIC_CONTEXT_PATTERN.test(line)) return true;
+  }
+  return OUTCOME_METRIC_NA_PATTERN.test(text);
+}
+
+/**
+ * Fail-closed guard for the `done` transition (AGE-626): when an issue's own
+ * (effective) title states a quantity/rate target, OR promises a
+ * measurement outright (re-measure/verify/confirm/audit), block `done`
+ * unless a pasted post-deploy measurement of that same metric exists
+ * somewhere in the issue's description or comment thread. Independent of,
+ * and does not substitute for, AGE-569's PR-merge/CI gate -- both must pass.
+ */
+async function assertOutcomeMetricEvidenceForQuantityTargetTitle(
+  db: Db,
+  issueId: string,
+  effectiveTitle: string | null,
+  effectiveDescription: string | null,
+) {
+  if (!issueTitleRequiresOutcomeMetricEvidence(effectiveTitle)) return;
+  if (textHasOutcomeMetricEvidence(effectiveDescription)) return;
+  const rows = await db
+    .select({ body: issueComments.body })
+    .from(issueComments)
+    .where(and(eq(issueComments.issueId, issueId), isNull(issueComments.deletedAt)));
+  for (const row of rows) {
+    if (textHasOutcomeMetricEvidence(row.body)) return;
+  }
+  throw unprocessable(
+    "Cannot mark issue done: this issue's title states a quantity/rate target or promises a measurement (re-measure/verify/confirm/audit), but no post-deploy measurement of that metric was found in the description or comments. Paste a before/after number (e.g. \"alerts/day: 365 -> 4\"), or an explicit \"N/A -- no live traffic yet\" note with a name/date.",
+    { code: "done_transition_metric_gate", reason: "missing_outcome_measurement" },
+  );
+}
+
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
@@ -9604,6 +9703,14 @@ export function issueRoutes(
         candidateNewPullRequestRefs,
         textIsChanging,
         effectivePullRequestRefKeys,
+      );
+      // AGE-626: independent of the PR gate above -- a merged/green PR does
+      // not by itself satisfy a title that asserts a quantity/rate target.
+      await assertOutcomeMetricEvidenceForQuantityTargetTitle(
+        db,
+        existing.id,
+        effectiveTitle,
+        effectiveDescription,
       );
     }
     if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
