@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -66,8 +66,51 @@ type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+// What `runTerminalWorkspaceCleanup` captures, under the lifecycle lock,
+// about a `teardownCommand` it decided to run. `cleanupTerminalWorkspace`
+// executes it afterward, once the transaction that stamped the claim has
+// committed and the lock is released. See the metadata-key doc comments
+// below (`EXECUTION_WORKSPACE_TEARDOWN_*`) for why the claim exists.
+type TeardownClaim = {
+  token: string;
+  command: string;
+  projectWorkspaceCwd: string | null;
+  timeoutMs: number;
+};
 const execFileAsync = promisify(execFile);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+
+// The resumable-idle reaper (below) reclaims a workspace's git worktree the
+// moment its issue is no longer `in_progress` — every other status,
+// `done`/`cancelled` included, with no cooldown and no merged-PR requirement.
+// Removing a worktree is always safe: the branch and its commits stay in the
+// repo's object store, and the workspace can rebuild the worktree from that
+// branch on resume (see `reopenClosedIsolatedExecutionWorkspaceForIssue`). The
+// rule is deliberately a negative check on one status (`!== "in_progress"`),
+// not an enumerated allow-list: a future issue status is covered automatically
+// without a code change here, and there is no status this reaper is supposed
+// to leave alone. This reaper therefore never deletes the runtime-owned git
+// branch on this path (see `allowBranchDeletion` at its `cleanupTerminalWorkspace`
+// call below), regardless of status. `teardownCommand` is a separate concern
+// from worktree removal here: it runs only when this reaper independently
+// confirms (via a forced merge check, unrelated to issue status) that the
+// branch has landed — see the `assessDelivery(..., { forcePullRequestLookup:
+// true })` call at this reaper's own call site below, and
+// `isWorkspaceBranchConfirmedMerged`. So `teardownCommand` can fire here even
+// for a `blocked`/`in_review` workspace whose branch already merged, exactly
+// as it can for `done`/`cancelled`.
+// The terminal reaper (`sweepTerminalWorkspaces`, `TERMINAL_ISSUE_STATUSES`
+// above) is a separate, narrower path: it still requires a merged PR and its
+// own cooldown before it acts, and it is the only path that may opt into
+// deleting the branch, because it alone verifies the work was delivered. In
+// practice this reaper always reaches a `done`/`cancelled` workspace first
+// (no cooldown beats a 7-day default one), so the terminal reaper's own
+// worktree removal rarely fires under default configuration; it stays
+// available for its distinct, delivery-verified guarantees. Both reapers can
+// independently trigger `teardownCommand` on merge confirmation; whichever
+// visits the workspace first wins, and the completion/claim metadata (see
+// `readExecutionWorkspaceTeardownState` below) keeps a second visit from
+// re-running it.
 
 // Return the timestamp when an issue became terminal. A `done` issue uses
 // `completedAt`. A `cancelled` issue uses `cancelledAt`. The reaper cooldown
@@ -89,6 +132,18 @@ function issueTerminalTimestamp(issue: {
 const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
+
+// The cleanup reason recorded when the resumable-idle reaper (not the terminal
+// reaper) archives a workspace. Kept distinct from
+// `ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON` so the two reclaim paths stay
+// distinguishable in the UI and in activity-log entries.
+export const ISSUE_RESUMABLE_IDLE_WORKSPACE_CLEANUP_REASON = "issue_resumable_idle";
+
+// The cleanup reason recorded when the orphan reaper archives a workspace
+// whose source issue was hard-deleted (`sourceIssueId` set to null by the
+// issue's `onDelete: "set null"` foreign key). Kept distinct so an orphan
+// reclaim is distinguishable from the other two in the UI and activity log.
+export const ISSUE_ORPHANED_WORKSPACE_CLEANUP_REASON = "issue_orphaned";
 
 // The reopen-failure reason kept on the row when a rebuild does not finish. The
 // value is sanitized: it never contains a repository URL, a host path, or git
@@ -201,6 +256,69 @@ export function clearMetadataReopenPendingConsumption(
   return next;
 }
 
+// `teardownCommand` runs outside the lifecycle-lock transaction (see
+// `cleanupTerminalWorkspace`/`runTerminalWorkspaceCleanup`), because it is a
+// user-supplied shell command that can run for minutes, and holding the
+// per-workspace Postgres advisory lock (and a pooled connection) for that long
+// would block a concurrent reopen of the same workspace. These three metadata
+// keys replace that lock for teardown's own concurrency and idempotency needs:
+// a claim, stamped atomically in the same transactional write that decides to
+// run teardown, stops two overlapping reaper calls (or the terminal and
+// resumable-idle reapers visiting the same merged-branch workspace) from both
+// running it; a completion timestamp, stamped after it succeeds, makes a later
+// reopen-then-re-close cycle skip re-running it for a branch already torn down.
+export const EXECUTION_WORKSPACE_TEARDOWN_CLAIMED_AT_METADATA_KEY = "teardownClaimedAt";
+export const EXECUTION_WORKSPACE_TEARDOWN_CLAIM_TOKEN_METADATA_KEY = "teardownClaimToken";
+export const EXECUTION_WORKSPACE_TEARDOWN_COMPLETED_AT_METADATA_KEY = "teardownCompletedAt";
+
+export function readExecutionWorkspaceTeardownState(
+  metadata: Record<string, unknown> | null | undefined,
+): { claimedAt: Date | null; claimToken: string | null; completedAt: Date | null } {
+  const readDate = (raw: unknown): Date | null => {
+    if (typeof raw !== "string") return null;
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  };
+  const claimToken = metadata?.[EXECUTION_WORKSPACE_TEARDOWN_CLAIM_TOKEN_METADATA_KEY];
+  return {
+    claimedAt: readDate(metadata?.[EXECUTION_WORKSPACE_TEARDOWN_CLAIMED_AT_METADATA_KEY]),
+    claimToken: typeof claimToken === "string" ? claimToken : null,
+    completedAt: readDate(metadata?.[EXECUTION_WORKSPACE_TEARDOWN_COMPLETED_AT_METADATA_KEY]),
+  };
+}
+
+// Stamp a fresh teardown claim. The caller keeps every other metadata key. A
+// caller must have already confirmed no completion and no still-fresh claim
+// exist (see `readExecutionWorkspaceTeardownState`) before it calls this,
+// since the stamp itself does not check.
+function setExecutionWorkspaceTeardownClaim(
+  metadata: Record<string, unknown> | null | undefined,
+  claim: { token: string; at: Date },
+): Record<string, unknown> {
+  return {
+    ...(metadata ?? {}),
+    [EXECUTION_WORKSPACE_TEARDOWN_CLAIMED_AT_METADATA_KEY]: claim.at.toISOString(),
+    [EXECUTION_WORKSPACE_TEARDOWN_CLAIM_TOKEN_METADATA_KEY]: claim.token,
+  };
+}
+
+// Record that a claimed teardown attempt finished. On success it stamps the
+// completion timestamp (so a later attempt sees `completedAt` and skips
+// permanently, per `readExecutionWorkspaceTeardownState`) and clears the claim.
+// On failure it only clears the claim, so a later attempt is not forced to
+// wait out the staleness window before it may retry a command that never
+// actually ran to completion.
+function settleExecutionWorkspaceTeardownClaim(
+  metadata: Record<string, unknown> | null | undefined,
+  outcome: { ok: true; at: Date } | { ok: false },
+): Record<string, unknown> {
+  const next = { ...(metadata ?? {}) };
+  delete next[EXECUTION_WORKSPACE_TEARDOWN_CLAIMED_AT_METADATA_KEY];
+  delete next[EXECUTION_WORKSPACE_TEARDOWN_CLAIM_TOKEN_METADATA_KEY];
+  if (outcome.ok) next[EXECUTION_WORKSPACE_TEARDOWN_COMPLETED_AT_METADATA_KEY] = outcome.at.toISOString();
+  return next;
+}
+
 // Acquire the per-workspace, transaction-scoped Postgres advisory lock. Postgres
 // releases the lock when the transaction that holds `tx` commits or rolls back.
 // Both the reopen path and the destructive cleanup path acquire the same lock,
@@ -231,6 +349,26 @@ export type ExecutionWorkspaceServiceOptions = {
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
   workspaceReaperCooldownDays?: number;
+  // How long a reaper-triggered `teardownCommand` may run before it is killed.
+  // Teardown runs after the lifecycle-lock transaction commits (see
+  // `cleanupTerminalWorkspace`'s claim/execute/settle split), so it no longer
+  // pins a pooled DB connection or blocks a concurrent reopen while it runs;
+  // this timeout instead just bounds how long a single reaper pass can spend
+  // waiting on one workspace's teardown before moving on. The default is 2
+  // minutes — long enough for a typical `docker compose down`-style teardown,
+  // short enough that one hung command cannot meaningfully stall a sweep.
+  teardownCommandTimeoutMs?: number;
+  // Whether `sweepTerminalWorkspaces` is allowed to delete the git branch of
+  // a workspace whose delivery is confirmed merged, once its cooldown has
+  // elapsed. Defaults to `false`: with it off, that reaper still verifies
+  // delivery, archives the row, stops runtime services, and removes the
+  // worktree directory — it just never calls `cleanupTerminalWorkspace` with
+  // `allowBranchDeletion: true`. A dirty (uncommitted-changes) workspace can
+  // sit past cooldown indefinitely without the resumable-idle reaper ever
+  // closing it first (dirty trees are never removed), so this cannot be left
+  // to an implicit race between the two reapers — it needs its own explicit
+  // opt-in.
+  allowTerminalWorkspaceBranchDeletion?: boolean;
 };
 
 function parseGitHubRepository(repoUrl: string | null) {
@@ -262,6 +400,25 @@ export function deriveExecutionWorkspaceDeliveryState(input: {
   if (input.isMergedIntoBase === true) return "merged_by_ancestry";
   if (input.isMergedIntoBase === false && !input.pullRequestStateUnknown) return "unmerged";
   return "unknown";
+}
+
+// Whether a workspace's branch is confirmed merged, independent of issue
+// status. This is the gate for automatic `teardownCommand` execution: unlike
+// `deriveExecutionWorkspaceDeliveryState`'s `merged_via_pr` case (which also
+// requires `sourceIssueTerminal`, so it never fires for e.g. an `in_review`
+// issue), teardown must fire the moment the branch lands, whether the issue
+// is `done`, still `in_review`, or anything else. It ORs the two existing
+// merge signals the terminal reaper already relies on: a squash-merged PR
+// (`mergedPullRequest`, from the GitHub API) or a fast-forward/merge-commit
+// merge detected purely from local git ancestry (`isMergedIntoBase`). Both
+// signals fail closed (stay `false`/`null`) when merge state cannot be
+// determined, so this helper fails closed too: no positive confirmation, no
+// teardown.
+function isWorkspaceBranchConfirmedMerged(
+  assessment: { mergedPullRequest: boolean },
+  git: ExecutionWorkspaceCloseGitReadiness | null,
+): boolean {
+  return assessment.mergedPullRequest || git?.isMergedIntoBase === true;
 }
 
 export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore";
@@ -1263,6 +1420,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     0,
     (opts.workspaceReaperCooldownDays ?? 7) * 24 * 60 * 60 * 1000,
   );
+  // Bounds how long a reaper-triggered `teardownCommand` may run. See the
+  // `teardownCommandTimeoutMs` doc comment on `ExecutionWorkspaceServiceOptions`.
+  const teardownCommandTimeoutMs = Math.max(0, opts.teardownCommandTimeoutMs ?? 2 * 60 * 1000);
+  // Off by default: see the doc comment on `allowTerminalWorkspaceBranchDeletion`
+  // above. An operator opts in explicitly (via `PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION`
+  // in `config.ts`) to let the terminal reaper delete a delivered branch.
+  const allowTerminalWorkspaceBranchDeletion = opts.allowTerminalWorkspaceBranchDeletion === true;
+  // How long a teardown claim (see `setExecutionWorkspaceTeardownClaim`) is
+  // treated as still in flight before another reaper pass may reclaim it and
+  // retry. This must comfortably exceed `teardownCommandTimeoutMs` plus the
+  // kill grace period (`EXECUTE_PROCESS_KILL_GRACE_MS` in workspace-runtime.ts)
+  // so a claim is never reclaimed while its own timeout-driven kill is still
+  // in flight; the fixed 60s pad below covers scheduling jitter on top of that.
+  const teardownClaimStaleAfterMs = teardownCommandTimeoutMs + 60 * 1000;
   const pullRequestStateCache = new Map<
     string,
     {
@@ -1294,6 +1465,29 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // removes the upper bound and makes the scan chase newer churn again. This
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
+
+  // The resumable-idle reaper keeps the same keyset-cursor / frozen-boundary /
+  // single-flight scheme as the terminal reaper above, for the same reasons,
+  // but as its own independent state: the two reapers scan overlapping
+  // candidate sets (both start from `active`/`idle`/`in_review` workspaces) at
+  // different cooldowns, so sharing a cursor would let one reaper's progress
+  // starve the other's.
+  let resumableIdleSweepCursor: { updatedAt: Date; id: string } | null = null;
+  let resumableIdleSweepBoundary: Date | null = null;
+  let resumableIdleSweepInProgress = false;
+
+  // The orphan reaper covers a narrow gap the two reapers above cannot: a
+  // workspace whose source issue was hard-deleted has `sourceIssueId = null`
+  // (the issue's `onDelete: "set null"` foreign key clears it, but does not
+  // cascade-delete the workspace row), and both reapers above only ever
+  // select `sourceIssueId IS NOT NULL` candidates, so an orphaned workspace
+  // is invisible to both and would otherwise leak its worktree forever. This
+  // reaper is deliberately simpler than the other two: it does not need the
+  // keyset-cursor / frozen-boundary machinery, since it is expected to see a
+  // small, rare candidate set (an orphan only exists between a hard issue
+  // delete and this reaper's next tick), so a single-flight guard is enough
+  // to keep two overlapping sweeps from double-processing the same page.
+  let orphanSweepInProgress = false;
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
@@ -1354,6 +1548,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function assessDelivery(
     workspace: ExecutionWorkspaceRow,
     git: ExecutionWorkspaceCloseGitReadiness | null,
+    // The merged-PR lookup below only runs when the source issue is terminal,
+    // because every existing caller (`hydrateWorkspace`, `getCloseReadiness`,
+    // `sweepTerminalWorkspaces`) only needs delivery state for a terminal
+    // issue, and skipping the lookup otherwise avoids a GitHub API call on
+    // every hydration of an active workspace. `forcePullRequestLookup` lets a
+    // caller that needs to know "is the branch merged" independent of issue
+    // status (the teardown gate below, evaluated from the resumable-idle
+    // reaper for a non-terminal issue such as `in_review`) opt into the same
+    // lookup without changing the default behavior or cost profile for any
+    // other caller.
+    options: { forcePullRequestLookup?: boolean } = {},
   ) {
     const issueTree = await listWorkspaceIssueTree(workspace);
     const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
@@ -1378,7 +1583,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .catch(() => null)
       : null;
 
-    if (sourceIssueTerminal) {
+    if (sourceIssueTerminal || options.forcePullRequestLookup) {
       const products = await listDeliveryPullRequestProducts(workspace);
       for (const product of products) {
         const references = extractGitHubPullRequestReferences([
@@ -1434,6 +1639,59 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       sourceIssueTerminal,
       subtreeTerminal,
       cooldownAnchor,
+      workspaceDirty: Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles),
+      workspaceHeadSha,
+      // Exposed (in addition to `deliveryState`) so a caller can test "is the
+      // branch merged" on its own, independent of `sourceIssueTerminal`.
+      // `deriveExecutionWorkspaceDeliveryState`'s `merged_via_pr` case still
+      // requires `sourceIssueTerminal`, so `deliveryState` itself is unchanged
+      // for every existing consumer; only this raw flag lets a non-terminal
+      // caller (see `isWorkspaceBranchConfirmedMerged` below) detect a merge.
+      mergedPullRequest,
+    };
+  }
+
+  // Assess whether a workspace is eligible for the resumable-idle reaper. This
+  // deliberately does not require delivery verification (no merged-PR lookup),
+  // and it covers `done`/`cancelled` too, not just `backlog`/`todo`/`blocked`/
+  // `in_review`: requiring a merged PR here would make the reaper a no-op for
+  // the common "stuck task" case, and holding a `done`/`cancelled` worktree for
+  // a delivery check just to remove a directory wastes disk for no safety
+  // benefit. It is still safe to reclaim without that check because the caller
+  // only removes the worktree (the branch and its commits stay in the repo's
+  // object store) and never deletes the runtime-owned git branch on this path,
+  // and because `workspaceDirty` below still blocks the reclaim when the
+  // worktree carries uncommitted or untracked changes (git itself also
+  // refuses a non-forced `git worktree remove` on a dirty tree, so this is a
+  // defense-in-depth check, not the only guard).
+  async function assessResumableIdle(
+    workspace: ExecutionWorkspaceRow,
+    git: ExecutionWorkspaceCloseGitReadiness | null,
+  ) {
+    const issueTree = await listWorkspaceIssueTree(workspace);
+    const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
+    // The whole rule is "not in_progress" — a negative check on one status,
+    // not an enumerated allow-list, so every other status (including
+    // `done`/`cancelled` and any status added later) is covered automatically.
+    const sourceIssueResumableIdle = Boolean(
+      sourceIssue && sourceIssue.status !== "in_progress",
+    );
+    // No issue in the tree may be actively executing. Unlike the terminal
+    // reaper's `subtreeTerminal` (an allow-list of done/cancelled), this is a
+    // deny-list of one status: `in_progress` is the only status that means
+    // "still being worked", so a backlog/todo/blocked/in_review/done/cancelled
+    // descendant never blocks this reaper, only an in_progress one does.
+    const subtreeNotActive = Boolean(
+      sourceIssue && issueTree.every((issue) => issue.status !== "in_progress"),
+    );
+    const workspaceHeadSha = git?.repoRoot && git.workspacePath
+      ? await runGit(["rev-parse", "HEAD"], git.workspacePath)
+        .then((result) => result.stdout.trim() || null)
+        .catch(() => null)
+      : null;
+    return {
+      sourceIssueResumableIdle,
+      subtreeNotActive,
       workspaceDirty: Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles),
       workspaceHeadSha,
     };
@@ -1648,6 +1906,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
     capturedGeneration: number,
+    // `allowBranchDeletion` defaults to `false`: this reaper-facing gateway
+    // never deletes the runtime-owned git branch unless a caller explicitly
+    // opts in. `sweepTerminalWorkspaces` is the only caller that can ever
+    // pass `{ allowBranchDeletion: true }`, and only when the operator has
+    // separately turned on `allowTerminalWorkspaceBranchDeletion`
+    // (`PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION`, off by default) —
+    // it alone verifies the work was delivered (merged PR) before it ever
+    // reaches this function.
+    // `branchMerged` defaults to `false` (no teardown): a caller passes `true`
+    // only after it independently confirmed the branch is merged (see
+    // `isWorkspaceBranchConfirmedMerged`), so an unknown merge state fails
+    // closed and never runs `teardownCommand`.
+    options: { allowBranchDeletion?: boolean; branchMerged?: boolean } = {},
   ): Promise<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }> {
     // The gateway holds the per-workspace lifecycle lock across the destructive
     // actions. A reopen takes the same lock, so a reopen cannot rebuild the
@@ -1657,7 +1928,23 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     // the pooled connection without a self-block. A reopen restored this
     // workspace after it was archived when the guard fails, so the cleanup skips
     // and does not destroy the rebuilt worktree.
-    return fenceLifecycleGenerationWrite<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }>({
+    //
+    // `teardownCommand` is deliberately NOT part of this locked write. It is a
+    // potentially long-running, user-supplied shell command, and holding the
+    // advisory lock (and a pooled DB connection) for its duration would block
+    // a concurrent reopen of the same workspace for as long as it runs. The
+    // locked write below only decides whether teardown should run and, if so,
+    // atomically stamps a claim (see `setExecutionWorkspaceTeardownClaim`) so
+    // a second concurrent cleanup attempt for the same workspace never also
+    // claims it. Once the transaction commits (lock released), this function
+    // runs the claimed command outside any lock, then records the outcome in
+    // a small, separate, best-effort write.
+    const fenced = await fenceLifecycleGenerationWrite<{
+      cleaned: boolean;
+      warnings: string[];
+      skippedReopened?: boolean;
+      teardownClaim: TeardownClaim | null;
+    }>({
       workspaceId: workspace.id,
       expectedGeneration: capturedGeneration,
       isWriteTarget: (fresh) => isClosedExecutionWorkspaceStatus(fresh.status),
@@ -1665,12 +1952,81 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         event: "execution_workspace.cleanup_skipped",
         message: "execution workspace cleanup skipped because it was reopened",
       },
-      onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true, teardownClaim: null }),
+      write: ({ fresh }) => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, options, fresh.metadata),
     });
+    if (fenced.teardownClaim) {
+      await executeClaimedTeardown(workspace, fenced.teardownClaim);
+    }
+    return { cleaned: fenced.cleaned, warnings: fenced.warnings, skippedReopened: fenced.skippedReopened };
   }
 
-  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null) {
+  // Run a teardown command this reaper already claimed (see
+  // `runTerminalWorkspaceCleanup`), outside any DB transaction or advisory
+  // lock, then record the outcome in a small, separate write. That write is
+  // guarded by comparing the claim token still on the row, not by the
+  // lifecycle-generation fence: by the time teardown finishes, the workspace
+  // is already archived, and a fresh claim (stamped by a later attempt that
+  // decided this one had gone stale) must not be stomped by a late outcome
+  // write from this one. A failure only clears the claim (so a later pass
+  // may retry promptly, without waiting out the staleness window) and never
+  // touches `status`/`cleanupReason` for worktree removal, keeping teardown
+  // failures from blocking or masking that removal, which already succeeded
+  // by the time a claim exists.
+  async function executeClaimedTeardown(workspace: ExecutionWorkspaceRow, claim: TeardownClaim): Promise<void> {
+    const [{ runClaimedTeardownCommand }, { workspaceOperationService }] = await Promise.all([
+      import("./workspace-runtime.js"),
+      import("./workspace-operations.js"),
+    ]);
+    const outcome = await runClaimedTeardownCommand({
+      workspace,
+      command: claim.command,
+      projectWorkspaceCwd: claim.projectWorkspaceCwd,
+      recorder: workspaceOperationService(db).createRecorder({
+        companyId: workspace.companyId,
+        executionWorkspaceId: workspace.id,
+      }),
+      timeoutMs: claim.timeoutMs,
+    });
+    const [row] = await db
+      .select({ metadata: executionWorkspaces.metadata, cleanupReason: executionWorkspaces.cleanupReason })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspace.id));
+    if (!row) return;
+    const currentState = readExecutionWorkspaceTeardownState(row.metadata as Record<string, unknown> | null);
+    if (currentState.claimToken !== claim.token) {
+      // A newer claim (or a completion) already superseded this one; do not
+      // stomp it with a stale outcome.
+      return;
+    }
+    const metadata = settleExecutionWorkspaceTeardownClaim(
+      row.metadata as Record<string, unknown> | null,
+      outcome.ok ? { ok: true, at: now() } : { ok: false },
+    );
+    await db
+      .update(executionWorkspaces)
+      .set({
+        metadata,
+        ...(outcome.ok
+          ? {}
+          : { cleanupReason: [row.cleanupReason, `teardownCommand failed: ${outcome.error}`].filter(Boolean).join(" | ") }),
+        updatedAt: now(),
+      })
+      .where(eq(executionWorkspaces.id, workspace.id));
+    if (!outcome.ok) {
+      logger.warn(
+        { event: "execution_workspace.teardown_failed", executionWorkspaceId: workspace.id, error: outcome.error },
+        "execution workspace teardownCommand failed",
+      );
+    }
+  }
+
+  async function runTerminalWorkspaceCleanup(
+    workspace: ExecutionWorkspaceRow,
+    expectedHeadSha: string | null,
+    options: { allowBranchDeletion?: boolean; branchMerged?: boolean } = {},
+    freshMetadata: Record<string, unknown> | null = (workspace.metadata as Record<string, unknown> | null) ?? null,
+  ): Promise<{ cleaned: boolean; warnings: string[]; teardownClaim: TeardownClaim | null; cleanedPath?: string | null }> {
     const [
       {
         acquireGitWorktreeCleanupLock,
@@ -1699,7 +2055,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .where(and(eq(projects.companyId, workspace.companyId), eq(projects.id, workspace.projectId)))
         .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy)),
     ]);
-    const config = readExecutionWorkspaceConfig((workspace.metadata as Record<string, unknown> | null) ?? null);
+    const config = readExecutionWorkspaceConfig(freshMetadata);
+    const teardownCommand = config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null;
 
     const cleanupLock = workspace.providerType === "git_worktree" && (workspace.providerRef ?? workspace.cwd)
       ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
@@ -1717,7 +2074,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         workspace,
         projectWorkspace,
         cleanupCommand: config?.cleanupCommand ?? null,
-        teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
+        teardownCommand,
         recorder: workspaceOperationService(db).createRecorder({
           companyId: workspace.companyId,
           executionWorkspaceId: workspace.id,
@@ -1731,6 +2088,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // verified HEAD so a raced ref update fails closed.
         runCleanupCommands: false,
         forceWorktreeRemoval: false,
+        // Defaults to `false`: the runtime-owned git branch is only deleted
+        // when a caller explicitly opts in via `allowBranchDeletion: true`.
+        // `sweepTerminalWorkspaces` is the sole caller that opts in, because
+        // it alone verifies the work was delivered (merged PR) before it gets
+        // here. The resumable-idle reaper always passes `false` (or omits the
+        // option): it never verifies delivery, so it must never delete the
+        // branch, only the worktree — including for `done`/`cancelled` issues.
+        deleteBranch: options.allowBranchDeletion === true,
+        // `teardownCommand` never runs inside this call, regardless of
+        // `options.branchMerged`: it always runs after this whole locked
+        // write commits (see the claim/execute/settle split below and in
+        // `cleanupTerminalWorkspace`/`executeClaimedTeardown`), so it cannot
+        // hold the lifecycle lock for as long as a user-supplied command
+        // takes to run.
+        runTeardownCommand: false,
       });
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
         await db
@@ -1741,18 +2113,44 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             eq(issues.executionWorkspaceId, workspace.id),
           ));
       }
+      // Decide whether to claim a teardown attempt. `branchMerged` gates it
+      // independently of worktree removal and of issue status — see
+      // `isWorkspaceBranchConfirmedMerged` at each reaper's own call site.
+      // `readExecutionWorkspaceTeardownState`/`teardownClaimStaleAfterMs`
+      // make this idempotent (skip once `completedAt` is stamped) and safe
+      // against a second concurrent caller (skip while another claim is
+      // still fresh); a stale claim (its owner crashed or exceeded its own
+      // timeout without settling) may be reclaimed.
+      let teardownClaim: TeardownClaim | null = null;
+      let metadataPatch: Record<string, unknown> | null = null;
+      if (options.branchMerged === true && teardownCommand) {
+        const teardownState = readExecutionWorkspaceTeardownState(freshMetadata);
+        const staleBefore = new Date(now().getTime() - teardownClaimStaleAfterMs);
+        const claimIsFresh = teardownState.claimedAt !== null && teardownState.claimedAt.getTime() > staleBefore.getTime();
+        if (teardownState.completedAt === null && !claimIsFresh) {
+          const token = randomUUID();
+          teardownClaim = {
+            token,
+            command: teardownCommand,
+            projectWorkspaceCwd: projectWorkspace?.cwd ?? null,
+            timeoutMs: teardownCommandTimeoutMs,
+          };
+          metadataPatch = setExecutionWorkspaceTeardownClaim(freshMetadata, { token, at: now() });
+        }
+      }
       const cleanupReason = [ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON, ...cleanup.warnings].join(" | ");
-      if (!cleanup.cleaned || cleanup.warnings.length > 0) {
+      if (!cleanup.cleaned || cleanup.warnings.length > 0 || metadataPatch) {
         await db
           .update(executionWorkspaces)
           .set({
             ...(cleanup.cleaned ? {} : { status: "cleanup_failed" }),
-            cleanupReason,
+            ...(!cleanup.cleaned || cleanup.warnings.length > 0 ? { cleanupReason } : {}),
+            ...(metadataPatch ? { metadata: metadataPatch } : {}),
             updatedAt: now(),
           })
           .where(eq(executionWorkspaces.id, workspace.id));
       }
-      return cleanup;
+      return { ...cleanup, teardownClaim };
     } finally {
       await cleanupLock?.release();
     }
@@ -2819,7 +3217,26 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         try {
-          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration);
+          // Branch deletion is opt-in and off by default
+          // (`allowTerminalWorkspaceBranchDeletion`, sourced from
+          // `PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION`). With it off,
+          // this reaper still verifies delivery, archives the row, and calls
+          // `cleanupTerminalWorkspace` to stop runtime services and remove the
+          // worktree directory — it just never asks that call to delete the
+          // branch. Even when the flag is on, this remains the only caller
+          // that may set `allowBranchDeletion: true`; every other caller
+          // (notably the resumable-idle reaper and the orphan reaper) always
+          // passes `false` and can never delete a branch regardless of this
+          // flag.
+          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, {
+            allowBranchDeletion: allowTerminalWorkspaceBranchDeletion,
+            // The eligibility check above already required `deliveryState` to
+            // be `merged_via_pr` or `merged_by_ancestry`, so the branch is
+            // already confirmed merged here; `isWorkspaceBranchConfirmedMerged`
+            // re-derives the same signal directly so this stays correct even if
+            // the eligibility check above ever changes.
+            branchMerged: isWorkspaceBranchConfirmedMerged(assessment, git),
+          });
           if (cleanup.skippedReopened) result.skippedReopened += 1;
           else if (!cleanup.cleaned) result.cleanupFailed += 1;
           else result.archived += 1;
@@ -2850,6 +3267,499 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return result;
       } finally {
         terminalSweepInProgress = false;
+      }
+    },
+
+    // Reclaim a workspace's git worktree the moment its issue tree is no
+    // longer actively executing — any status other than `in_progress`,
+    // `done`/`cancelled` included, with no exceptions. Structurally this
+    // mirrors `sweepTerminalWorkspaces` above (same keyset scan, same
+    // per-workspace lifecycle lock, same generation fencing), but it is
+    // intentionally a separate sweep rather than a widened
+    // `TERMINAL_ISSUE_STATUSES`:
+    //   - it reclaims immediately, with no cooldown and no merged-PR
+    //     requirement, even for `done`/`cancelled`: removing a worktree never
+    //     touches the branch or its commits, so there is nothing to lose by
+    //     removing it right away, and a worktree's `node_modules` etc. can be
+    //     gigabytes, so holding it for days after a task stops running wastes
+    //     disk for no safety benefit;
+    //   - it therefore never deletes the runtime-owned git branch, only the
+    //     worktree, since delivery was never verified on this path (only
+    //     `sweepTerminalWorkspaces` may opt into deleting the branch, and only
+    //     because it verifies the work was merged first); and
+    //   - `teardownCommand`, in contrast to worktree removal, is gated on
+    //     branch-merge state, not on issue status: this sweep independently
+    //     forces a merge check (`assessDelivery(..., { forcePullRequestLookup:
+    //     true })`) right before it calls `cleanupTerminalWorkspace`, so
+    //     teardown still fires here the moment the branch is confirmed merged
+    //     — even for a `blocked`/`in_review` workspace that has not reached
+    //     `done`/`cancelled` — while an unconfirmed/unmerged branch fails
+    //     closed and never runs it.
+    // `sweepTerminalWorkspaces` above still exists and stays scheduled: it
+    // gates the same `done`/`cancelled` workspaces on its own merged-PR
+    // verification and (by default, 7-day) cooldown, and it is the only path
+    // allowed to prune the branch once delivery is confirmed. In practice this
+    // reaper reaches a `done`/`cancelled` workspace first (no cooldown beats a
+    // multi-day one), so under default configuration the terminal reaper's own
+    // worktree removal rarely fires for a given workspace; the two reapers
+    // race safely on the same per-workspace lifecycle lock and the loser's
+    // conditional `UPDATE` simply matches zero rows (`skippedRace`).
+    // A workspace this reaper archives can still be reopened through the same
+    // `reopenClosedIsolatedExecutionWorkspaceForIssue` path as a terminal
+    // workspace: that path clears `cleanupEligibleAt` and bumps the lifecycle
+    // generation, which fences off any cleanup this sweep queued but has not
+    // yet run, and it rebuilds the worktree from the surviving branch so the
+    // task can resume exactly where it left off.
+    sweepResumableIdleWorkspaces: async (limit = 50) => {
+      // Skip this sweep while another sweep runs. A concurrent sweep would share
+      // the cursor and the boundary and could corrupt the rotation state. A
+      // skipped tick is safe: the next tick runs the sweep with intact state.
+      if (resumableIdleSweepInProgress) {
+        return {
+          checked: 0,
+          eligible: 0,
+          archived: 0,
+          cleanupFailed: 0,
+          skippedActiveRun: 0,
+          skippedNotResumableIdle: 0,
+          skippedDirty: 0,
+          skippedRace: 0,
+          skippedReopened: 0,
+          clearedStaleReopenPending: 0,
+        };
+      }
+      resumableIdleSweepInProgress = true;
+      try {
+      const baseCandidateFilter = and(
+        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+        isNull(executionWorkspaces.closedAt),
+        sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+      );
+      const cursor = resumableIdleSweepCursor;
+      if (!cursor) {
+        resumableIdleSweepBoundary = now();
+      }
+      const boundary = resumableIdleSweepBoundary;
+      const boundaryFilter = boundary
+        ? lte(executionWorkspaces.updatedAt, boundary)
+        : undefined;
+      const cursorFilter = cursor
+        ? or(
+            gt(executionWorkspaces.updatedAt, cursor.updatedAt),
+            and(
+              eq(executionWorkspaces.updatedAt, cursor.updatedAt),
+              gt(executionWorkspaces.id, cursor.id),
+            ),
+          )
+        : undefined;
+      const scanFilter = and(baseCandidateFilter, boundaryFilter, cursorFilter);
+      const candidates = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(scanFilter)
+        .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+        .limit(limit);
+      if (candidates.length < limit) {
+        resumableIdleSweepCursor = null;
+        resumableIdleSweepBoundary = null;
+      } else {
+        const lastCandidate = candidates[candidates.length - 1]!;
+        resumableIdleSweepCursor = { updatedAt: lastCandidate.updatedAt, id: lastCandidate.id };
+      }
+      const result = {
+        checked: candidates.length,
+        eligible: 0,
+        archived: 0,
+        cleanupFailed: 0,
+        skippedActiveRun: 0,
+        skippedNotResumableIdle: 0,
+        skippedDirty: 0,
+        skippedRace: 0,
+        skippedReopened: 0,
+        clearedStaleReopenPending: 0,
+      };
+
+      for (const workspace of candidates) {
+        const executionWorkspace = toExecutionWorkspace(workspace);
+        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
+        if (!statusInspectionSucceeded) {
+          result.skippedDirty += 1;
+          continue;
+        }
+        const assessment = await assessResumableIdle(workspace, git);
+        const reopenPending = metadataHasReopenPendingConsumption(
+          workspace.metadata as Record<string, unknown> | null,
+        );
+        if (!assessment.sourceIssueResumableIdle || !assessment.subtreeNotActive) {
+          if (reopenPending) {
+            await clearReopenPendingConsumptionUnderLock(workspace.id, {
+              expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
+                workspace.metadata as Record<string, unknown> | null,
+              ),
+            });
+          }
+          result.skippedNotResumableIdle += 1;
+          continue;
+        }
+        // Never remove a worktree with uncommitted or untracked changes: that
+        // content exists only on disk, not in the repo's object store, and a
+        // removal would lose it permanently. `cleanupTerminalWorkspace` below
+        // also passes `forceWorktreeRemoval: false`, so `git worktree remove`
+        // itself refuses a dirty tree even if this check is ever bypassed;
+        // this is the first, cheaper layer of that same guarantee, and it
+        // records the reason via `skippedDirty` in the sweep result the
+        // scheduler logs.
+        if (assessment.workspaceDirty) {
+          result.skippedDirty += 1;
+          continue;
+        }
+        if (reopenPending) {
+          const pendingSince = readMetadataReopenPendingConsumptionSince(
+            workspace.metadata as Record<string, unknown> | null,
+          );
+          const staleBefore = new Date(now().getTime() - STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS);
+          const stranded =
+            pendingSince === null
+            || pendingSince.getTime() <= staleBefore.getTime();
+          if (!stranded) {
+            result.skippedReopened += 1;
+            continue;
+          }
+          if (await workspaceHasActiveRun(workspace)) {
+            result.skippedReopened += 1;
+            continue;
+          }
+          const cleared = await clearReopenPendingConsumptionUnderLock(workspace.id, {
+            expectedGeneration: readExecutionWorkspaceLifecycleGeneration(
+              workspace.metadata as Record<string, unknown> | null,
+            ),
+            requireStaleSinceBefore: staleBefore,
+          });
+          if (cleared) {
+            result.clearedStaleReopenPending += 1;
+            logger.info(
+              {
+                event: "execution_workspace.reopen",
+                outcome: "stale_reopen_pending_cleared",
+                executionWorkspaceId: workspace.id,
+                sourceIssueId: workspace.sourceIssueId,
+                pendingSince: pendingSince?.toISOString() ?? null,
+              },
+              "cleared a stranded reopen-pending flag on a resumable-idle workspace",
+            );
+          }
+          continue;
+        }
+        if (await workspaceHasActiveRun(workspace)) {
+          result.skippedActiveRun += 1;
+          continue;
+        }
+        result.eligible += 1;
+        const closedAt = now();
+        const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
+          workspace.metadata as Record<string, unknown> | null,
+        );
+        const archived = await db.transaction(async (tx) => {
+          await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          return tx
+            .update(executionWorkspaces)
+            .set({
+              status: "archived",
+              closedAt,
+              cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
+              cleanupReason: ISSUE_RESUMABLE_IDLE_WORKSPACE_CLEANUP_REASON,
+              metadata: archivedMetadata,
+              updatedAt: closedAt,
+            })
+            .where(and(
+              eq(executionWorkspaces.id, workspace.id),
+              eq(executionWorkspaces.companyId, workspace.companyId),
+              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+              isNull(executionWorkspaces.closedAt),
+              sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
+              sql<boolean>`EXISTS (
+                SELECT 1
+                FROM ${issues} source_issue
+                WHERE source_issue.company_id = ${workspace.companyId}
+                  AND source_issue.id = ${workspace.sourceIssueId}
+                  AND source_issue.status <> 'in_progress'
+              )`,
+              sql<boolean>`NOT EXISTS (
+                SELECT 1
+                FROM ${issues} linked_issue
+                JOIN ${heartbeatRuns} live_run
+                  ON live_run.id = linked_issue.checkout_run_id
+                  OR live_run.id = linked_issue.execution_run_id
+                WHERE linked_issue.company_id = ${workspace.companyId}
+                  AND (
+                    linked_issue.execution_workspace_id = ${workspace.id}
+                    OR linked_issue.id = ${workspace.sourceIssueId}
+                  )
+                  AND live_run.company_id = ${workspace.companyId}
+                  AND live_run.status IN ('queued', 'running')
+              )`,
+              // No issue in the tree may still be actively executing. Unlike
+              // the terminal reaper's allow-list of done/cancelled, this is a
+              // deny-list of one status, so a backlog/todo/blocked/in_review/
+              // done/cancelled descendant never blocks the archive, only an
+              // in_progress one does.
+              sql<boolean>`NOT EXISTS (
+                WITH RECURSIVE issue_tree(id, status) AS (
+                  SELECT root.id, root.status
+                  FROM ${issues} root
+                  WHERE root.company_id = ${workspace.companyId}
+                    AND root.id = ${workspace.sourceIssueId}
+                  UNION ALL
+                  SELECT child.id, child.status
+                  FROM ${issues} child
+                  JOIN issue_tree parent ON child.parent_id = parent.id
+                  WHERE child.company_id = ${workspace.companyId}
+                )
+                SELECT 1 FROM issue_tree
+                WHERE status = 'in_progress'
+              )`,
+            ))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        });
+        if (!archived) {
+          result.skippedRace += 1;
+          continue;
+        }
+
+        await logActivity(db, {
+          companyId: archived.companyId,
+          actorType: "system",
+          actorId: "workspace_resumable_idle_reaper",
+          action: "execution_workspace.issue_resumable_idle_archived",
+          entityType: "execution_workspace",
+          entityId: archived.id,
+          details: {
+            sourceIssueId: archived.sourceIssueId,
+            cleanupEligibleAt: archived.cleanupEligibleAt?.toISOString() ?? null,
+            cleanupReason: ISSUE_RESUMABLE_IDLE_WORKSPACE_CLEANUP_REASON,
+          },
+        });
+
+        const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
+          archived.metadata as Record<string, unknown> | null,
+        );
+        // Worktree removal above never required delivery verification
+        // (`assessResumableIdle` deliberately skips the merged-PR lookup, see
+        // its doc comment), but `teardownCommand` must still fail closed
+        // unless the branch is confirmed merged. Force the lookup here so a
+        // `blocked`/`in_review` workspace whose branch already landed still
+        // tears down, even though its worktree-removal eligibility never
+        // checked delivery. This is a second, independent trigger from
+        // `sweepTerminalWorkspaces`'s own merge check: whichever reaper visits
+        // the workspace first evaluates teardown eligibility.
+        const deliveryAssessment = await assessDelivery(workspace, git, { forcePullRequestLookup: true });
+        const branchMerged = isWorkspaceBranchConfirmedMerged(deliveryAssessment, git);
+        try {
+          const cleanup = await cleanupTerminalWorkspace(
+            archived,
+            assessment.workspaceHeadSha,
+            capturedGeneration,
+            // Delivery was never verified on this path, so the runtime-owned
+            // branch (if any) must survive even though the worktree is removed.
+            // `branchMerged` independently gates `teardownCommand` only, using
+            // the forced merge check above; it is unrelated to
+            // `allowBranchDeletion`, which stays `false` on this path.
+            { allowBranchDeletion: false, branchMerged },
+          );
+          if (cleanup.skippedReopened) result.skippedReopened += 1;
+          else if (!cleanup.cleaned) result.cleanupFailed += 1;
+          else result.archived += 1;
+        } catch (error) {
+          result.cleanupFailed += 1;
+          const failure = error instanceof Error ? error.message : String(error);
+          await markTerminalCleanupFailedFenced({
+            workspaceId: archived.id,
+            capturedGeneration,
+            cleanupReason: `${ISSUE_RESUMABLE_IDLE_WORKSPACE_CLEANUP_REASON} | ${failure}`,
+          });
+          await logActivity(db, {
+            companyId: archived.companyId,
+            actorType: "system",
+            actorId: "workspace_resumable_idle_reaper",
+            action: "execution_workspace.issue_resumable_idle_cleanup_failed",
+            entityType: "execution_workspace",
+            entityId: archived.id,
+            details: { sourceIssueId: archived.sourceIssueId, failure },
+          });
+        }
+      }
+      return result;
+      } finally {
+        resumableIdleSweepInProgress = false;
+      }
+    },
+
+    // Reclaim an orphaned workspace: one whose source issue no longer exists.
+    // Neither reaper above ever selects it (`sourceIssueId IS NOT NULL` gates
+    // both candidate queries), so without this it leaks forever. This path
+    // only ever removes the worktree directory — never the branch, and never
+    // `teardownCommand` — because there is no issue left to derive a merge
+    // state from, so it always fails closed on the very thing that would let
+    // it decide differently. `provisionCommand` is not re-run either, since
+    // there is nothing left to resume.
+    sweepOrphanedWorkspaces: async (limit = 50) => {
+      // Skip this sweep while another sweep runs. See the other two reapers'
+      // own single-flight guards for why: a concurrent sweep over the same
+      // page could double-process the same candidates.
+      if (orphanSweepInProgress) {
+        return {
+          checked: 0,
+          eligible: 0,
+          archived: 0,
+          cleanupFailed: 0,
+          skippedActiveRun: 0,
+          skippedDirty: 0,
+          skippedRace: 0,
+        };
+      }
+      orphanSweepInProgress = true;
+      try {
+      const candidates = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(and(
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+          isNull(executionWorkspaces.sourceIssueId),
+        ))
+        .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+        .limit(limit);
+
+      const result = {
+        checked: candidates.length,
+        eligible: 0,
+        archived: 0,
+        cleanupFailed: 0,
+        skippedActiveRun: 0,
+        skippedDirty: 0,
+        skippedRace: 0,
+      };
+
+      for (const workspace of candidates) {
+        // A workspace can still be "in use" with no source issue of its own:
+        // `workspaceHasActiveRun` also checks for any OTHER issue whose
+        // `executionWorkspaceId` still points at this row (its own
+        // `sourceIssueId`-based check is skipped automatically since it is
+        // null here), which covers a shared workspace a live issue still
+        // references.
+        if (await workspaceHasActiveRun(workspace)) {
+          result.skippedActiveRun += 1;
+          continue;
+        }
+        const executionWorkspace = toExecutionWorkspace(workspace);
+        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
+        // Never remove a worktree this reaper could not positively confirm as
+        // clean, nor one it confirmed dirty: uncommitted or untracked content
+        // lives only on disk, and a removal would lose it permanently.
+        // `cleanupTerminalWorkspace` below also passes `forceWorktreeRemoval:
+        // false`, so `git worktree remove` itself refuses a dirty tree even
+        // if this check is ever bypassed.
+        const workspaceDirty = Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles);
+        if (!statusInspectionSucceeded || workspaceDirty) {
+          result.skippedDirty += 1;
+          continue;
+        }
+        // `cleanupTerminalWorkspace` refuses to run at all for a git-worktree
+        // workspace unless it is given the HEAD sha it should still find in
+        // place (`assertTerminalCleanupGitStateUnchanged`), the same
+        // read-then-recheck pattern `assessDelivery`/`assessResumableIdle`
+        // use for the other two reapers. Capture it here, right after the
+        // clean-tree check above, from the same git inspection.
+        const workspaceHeadSha = git?.repoRoot && git.workspacePath
+          ? await runGit(["rev-parse", "HEAD"], git.workspacePath)
+            .then((res) => res.stdout.trim() || null)
+            .catch(() => null)
+          : null;
+        result.eligible += 1;
+        const closedAt = now();
+        const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
+          workspace.metadata as Record<string, unknown> | null,
+        );
+        const archived = await db.transaction(async (tx) => {
+          await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          return tx
+            .update(executionWorkspaces)
+            .set({
+              status: "archived",
+              closedAt,
+              cleanupEligibleAt: workspace.cleanupEligibleAt ?? closedAt,
+              cleanupReason: ISSUE_ORPHANED_WORKSPACE_CLEANUP_REASON,
+              metadata: archivedMetadata,
+              updatedAt: closedAt,
+            })
+            .where(and(
+              eq(executionWorkspaces.id, workspace.id),
+              eq(executionWorkspaces.companyId, workspace.companyId),
+              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+              isNull(executionWorkspaces.closedAt),
+              isNull(executionWorkspaces.sourceIssueId),
+            ))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        });
+        if (!archived) {
+          result.skippedRace += 1;
+          continue;
+        }
+
+        await logActivity(db, {
+          companyId: archived.companyId,
+          actorType: "system",
+          actorId: "workspace_orphan_reaper",
+          action: "execution_workspace.orphaned_archived",
+          entityType: "execution_workspace",
+          entityId: archived.id,
+          details: {
+            cleanupEligibleAt: archived.cleanupEligibleAt?.toISOString() ?? null,
+            cleanupReason: ISSUE_ORPHANED_WORKSPACE_CLEANUP_REASON,
+          },
+        });
+
+        const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
+          archived.metadata as Record<string, unknown> | null,
+        );
+        try {
+          const cleanup = await cleanupTerminalWorkspace(
+            archived,
+            workspaceHeadSha,
+            capturedGeneration,
+            // No source issue survives to reconcile a raced HEAD change
+            // against, and no merge state can be derived without one, so
+            // this path never deletes the branch and never runs
+            // `teardownCommand`.
+            { allowBranchDeletion: false, branchMerged: false },
+          );
+          if (cleanup.skippedReopened) result.skippedActiveRun += 1;
+          else if (!cleanup.cleaned) result.cleanupFailed += 1;
+          else result.archived += 1;
+        } catch (error) {
+          result.cleanupFailed += 1;
+          const failure = error instanceof Error ? error.message : String(error);
+          await markTerminalCleanupFailedFenced({
+            workspaceId: archived.id,
+            capturedGeneration,
+            cleanupReason: `${ISSUE_ORPHANED_WORKSPACE_CLEANUP_REASON} | ${failure}`,
+          });
+          await logActivity(db, {
+            companyId: archived.companyId,
+            actorType: "system",
+            actorId: "workspace_orphan_reaper",
+            action: "execution_workspace.orphaned_cleanup_failed",
+            entityType: "execution_workspace",
+            entityId: archived.id,
+            details: { failure },
+          });
+        }
+      }
+      return result;
+      } finally {
+        orphanSweepInProgress = false;
       }
     },
 

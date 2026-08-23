@@ -99,6 +99,18 @@ const {
       skippedUndelivered: 0,
       skippedRace: 0,
     })),
+    sweepResumableIdleWorkspaces: vi.fn(async () => ({
+      checked: 0,
+      eligible: 0,
+      archived: 0,
+      cleanupFailed: 0,
+      skippedActiveRun: 0,
+      skippedNotResumableIdle: 0,
+      skippedDirty: 0,
+      skippedRace: 0,
+      skippedReopened: 0,
+      clearedStaleReopenPending: 0,
+    })),
   };
   const executionWorkspaceServiceFactoryMock = vi.fn(() => executionWorkspaceServiceMock);
   const externalObjectsServiceMock = {
@@ -500,6 +512,7 @@ describe("startServer feedback export wiring", () => {
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
       expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).toHaveBeenCalledTimes(1);
       expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
+      expect(executionWorkspaceServiceMock.sweepResumableIdleWorkspaces).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
     } finally {

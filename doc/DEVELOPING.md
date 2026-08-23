@@ -875,10 +875,56 @@ Environment overrides:
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace and deletes the worktree. A person can reopen
+  archives the execution workspace and, if branch deletion is turned on (see
+  `PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION` below) and a merged PR
+  confirms the work was delivered, deletes the git branch. A person can reopen
   the work inside this window. The default is `7`. A value of `0` disables the
-  cooldown and restores immediate reaping. A negative or non-numeric value falls
-  back to the default.
+  cooldown and restores immediate reaping. A negative or non-numeric value
+  falls back to the default. In practice the worktree directory itself is
+  almost always already gone by the time this cooldown elapses (see the
+  resumable-idle reaper below), so with branch deletion off (the default) this
+  reaper's day-to-day effect is limited to archiving the row and stopping
+  runtime services for workspaces the other reaper could not already close.
+- `PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION=true|false` — **off by
+  default.** When `false` (the default), the terminal-workspace reaper never
+  deletes a git branch under any circumstance: it still verifies delivery,
+  archives the row, stops runtime services, and removes the worktree
+  directory once the cooldown elapses, but it always leaves the branch (and
+  its commits) in place. This is not implied by anything else in the system —
+  a workspace whose worktree stays dirty (uncommitted or untracked changes)
+  is never closed by the no-cooldown resumable-idle reaper either, so nothing
+  else stops this flag from mattering: with it off, such a workspace can sit
+  past cooldown indefinitely without ever losing its branch. Set to `true`
+  only if automatic branch deletion, once delivery is confirmed merged, is
+  genuinely wanted. With this flag off, none of the three execution-workspace
+  reapers (terminal, resumable-idle, orphan) can ever delete a git branch; the
+  manual "close workspace" API route is the one operator-triggered exception,
+  since a human explicitly requests it there. Separately, the run-provisioning
+  rollback in `heartbeat.ts` can still delete a branch it just created,
+  moments earlier in the same call, if persisting that brand-new workspace to
+  the database fails right after creation — this is a distinct, pre-existing
+  undo-my-own-action safety net, not gated by this flag, and out of scope for
+  it: the branch it targets has no delivered work to lose (agent execution
+  has not started yet), but it is a second automatic branch-deletion path
+  worth knowing about.
+
+A second, separate reaper reclaims the git worktree the moment an issue tree
+leaves `in_progress`, for any other status — `done`/`cancelled` included, with
+no exceptions — no cooldown, since removing a worktree never touches the
+branch or its commits. It skips a workspace with uncommitted or untracked
+changes instead of removing it, and never deletes the git branch (branch
+deletion stays exclusive to the terminal reaper above, gated on its own
+merged-PR verification). `teardownCommand`, however, is gated on branch-merge
+state rather than on issue status or on which reaper is running: both reapers
+independently check whether the workspace's branch is confirmed merged (via a
+merged PR or local ancestry into its base ref) right before archiving, and run
+`teardownCommand` the moment that check passes — so a `blocked`/`in_review`
+workspace whose branch already landed gets torn down here even though it
+never reaches `done`/`cancelled`. An unconfirmed or unmerged branch fails
+closed and never runs it. A workspace this reaper archives rebuilds its
+worktree from the surviving branch the next time the task resumes; if that
+task's branch was already torn down, `provisionCommand` is expected to
+re-establish whatever `teardownCommand` removed.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

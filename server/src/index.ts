@@ -1145,6 +1145,7 @@ export async function startServer(): Promise<StartedServer> {
     });
     const terminalWorkspaces = executionWorkspaceService(db as any, {
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      allowTerminalWorkspaceBranchDeletion: config.workspaceReaperAllowBranchDeletion,
     });
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1187,6 +1188,66 @@ export async function startServer(): Promise<StartedServer> {
         })
         .catch((err) => {
           logger.error({ err }, "terminal issue workspace reaper failed");
+        }));
+    };
+
+    // Emit the same kind of periodic skip signal for the resumable-idle
+    // reaper, throttled the same way, so an inert reaper is never fully
+    // silent here either.
+    let lastResumableIdleWorkspaceSkipLogAt = 0;
+    const resumableIdleWorkspaceSkipLogIntervalMs = 10 * 60 * 1000;
+    const scheduleResumableIdleWorkspaceSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(terminalWorkspaces
+        .sweepResumableIdleWorkspaces()
+        .then((result) => {
+          if (result.archived > 0 || result.cleanupFailed > 0) {
+            logger.info(result, "resumable-idle issue workspace reaper changed workspace state");
+            return;
+          }
+          const skipped =
+            result.skippedActiveRun
+            + result.skippedNotResumableIdle
+            + result.skippedDirty
+            + result.skippedRace;
+          const nowMs = Date.now();
+          if (
+            skipped > 0
+            && nowMs - lastResumableIdleWorkspaceSkipLogAt >= resumableIdleWorkspaceSkipLogIntervalMs
+          ) {
+            lastResumableIdleWorkspaceSkipLogAt = nowMs;
+            logger.info(result, "resumable-idle issue workspace reaper skipped all candidates");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "resumable-idle issue workspace reaper failed");
+        }));
+    };
+
+    // Emit the same kind of periodic skip signal for the orphan reaper
+    // (workspaces whose source issue was hard-deleted), throttled the same
+    // way. This candidate set is expected to be small and rare, so the skip
+    // log is mostly a canary that the reaper is still running at all.
+    let lastOrphanedWorkspaceSkipLogAt = 0;
+    const orphanedWorkspaceSkipLogIntervalMs = 10 * 60 * 1000;
+    const scheduleOrphanedWorkspaceSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(terminalWorkspaces
+        .sweepOrphanedWorkspaces()
+        .then((result) => {
+          if (result.archived > 0 || result.cleanupFailed > 0) {
+            logger.info(result, "orphaned workspace reaper changed workspace state");
+            return;
+          }
+          const skipped = result.skippedActiveRun + result.skippedDirty + result.skippedRace;
+          const nowMs = Date.now();
+          if (skipped > 0 && nowMs - lastOrphanedWorkspaceSkipLogAt >= orphanedWorkspaceSkipLogIntervalMs) {
+            lastOrphanedWorkspaceSkipLogAt = nowMs;
+            logger.info(result, "orphaned workspace reaper skipped all candidates");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "orphaned workspace reaper failed");
         }));
     };
 
@@ -1459,6 +1520,8 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
         scheduleTerminalWorkspaceSweep();
+        scheduleResumableIdleWorkspaceSweep();
+        scheduleOrphanedWorkspaceSweep();
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();

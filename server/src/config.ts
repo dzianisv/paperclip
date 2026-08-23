@@ -70,6 +70,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  workspaceReaperAllowBranchDeletion: boolean;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -281,6 +282,17 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
+  // Whether the terminal-workspace reaper may delete a delivered workspace's
+  // git branch once it archives it. Off unless explicitly turned on: without
+  // it, that reaper still archives the row, stops runtime services, and
+  // removes the worktree directory once delivery is confirmed and the
+  // cooldown elapses — it just leaves the branch (and its commits) in place.
+  // This must not be inferred from any other setting (e.g. the cooldown
+  // above): a workspace that stays dirty past cooldown is never closed by the
+  // no-cooldown resumable-idle reaper either, so nothing else forces this
+  // reaper to skip it, and branch deletion needs its own explicit opt-in.
+  const workspaceReaperAllowBranchDeletion =
+    process.env.PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION === "true";
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -324,6 +336,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    workspaceReaperAllowBranchDeletion,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

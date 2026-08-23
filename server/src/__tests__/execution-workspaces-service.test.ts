@@ -31,11 +31,13 @@ import {
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
+  EXECUTION_WORKSPACE_TEARDOWN_COMPLETED_AT_METADATA_KEY,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
+  readExecutionWorkspaceTeardownState,
   readMetadataReopenPendingConsumptionSince,
 } from "../services/execution-workspaces.ts";
 import { issueService } from "../services/issues.ts";
@@ -295,7 +297,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   async function seedTerminalWorkspace(options: {
     mergedPr?: boolean;
     activeRun?: boolean;
-    childStatus?: "done" | "todo";
+    childStatus?: "done" | "todo" | "in_progress";
+    sourceIssueStatus?: "done" | "cancelled" | "blocked" | "in_review" | "backlog" | "todo" | "in_progress";
   } = {}) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -346,7 +349,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       identifier,
       title: "Delivered source issue",
-      status: "done",
+      status: options.sourceIssueStatus ?? "done",
       priority: "medium",
       executionWorkspaceId,
     });
@@ -934,6 +937,526 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
   });
 
+  // `allowTerminalWorkspaceBranchDeletion` (sourced from
+  // `PAPERCLIP_WORKSPACE_REAPER_ALLOW_BRANCH_DELETION`) gates the *only*
+  // reachable automatic code path that can ever delete a runtime-owned git
+  // branch. It defaults to `false`, so a deployment that never sets the env
+  // var keeps every branch it ever created, forever, regardless of how long
+  // a merged/terminal workspace sits past its cooldown.
+  describe("branch deletion opt-in", () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.UTC(2026, 5, 1);
+
+    function pastCooldownService(allowBranchDeletion: boolean) {
+      return executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) =>
+          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+          ?? { state: "unknown", headRef: null, headSha: null },
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: 7,
+        allowTerminalWorkspaceBranchDeletion: allowBranchDeletion,
+      });
+    }
+
+    async function markPastCooldown(seeded: { executionWorkspaceId: string; sourceIssueId: string }) {
+      // Ten days old clears the seven-day cooldown `pastCooldownService` uses.
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - 10 * DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs - 10 * DAY_MS) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+    }
+
+    // Branch deletion also requires the runtime-branch-ownership metadata
+    // marker (unmarked legacy rows fail closed regardless of the flag — see
+    // `isRuntimeOwnedGitBranch`). Stamp it so these tests isolate what the
+    // `allowTerminalWorkspaceBranchDeletion` flag itself decides, rather than
+    // being confounded by that separate, unrelated ownership gate.
+    async function stampRuntimeOwnedBranch(executionWorkspaceId: string) {
+      await db.update(executionWorkspaces).set({
+        metadata: { createdByRuntime: true, gitBranchOwnershipVersion: 1 },
+      }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+    }
+
+    async function statusOf(executionWorkspaceId: string) {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row?.status ?? null;
+    }
+
+    it("does not delete the branch of a dirty, merged, past-cooldown workspace even with the flag on", async () => {
+      // The requested regression case: a workspace stays dirty for a week
+      // after going `done` with a merged PR. Uncommitted work is not in the
+      // object store, so it must never be silently discarded — and git's own
+      // "branch checked out at worktree" refusal protects the branch here
+      // independent of the flag. This asserts that holds even with the flag
+      // deliberately turned ON, which is the strictest case.
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await markPastCooldown(seeded);
+      await stampRuntimeOwnedBranch(seeded.executionWorkspaceId);
+      await fs.writeFile(path.join(seeded.worktreePath, "uncommitted.txt"), "dirty\n", "utf8");
+
+      const sweep = await pastCooldownService(true).sweepTerminalWorkspaces();
+
+      // A dirty tree makes the git-derived delivery signal unverifiable, so
+      // the terminal reaper's own eligibility assessment fails closed before
+      // it ever reaches the destructive cleanup step — it never even
+      // attempts `git worktree remove` or branch deletion on a dirty tree.
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedUndelivered: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+    }, 20_000);
+
+    it("removes the worktree but preserves the branch for a clean, merged, past-cooldown workspace by default", async () => {
+      // This is the actual regression this round's flag fixes: before it
+      // existed, `sweepTerminalWorkspaces` deleted the branch unconditionally
+      // once a merged workspace cleared its cooldown. With the flag at its
+      // default (`false`, i.e. no `allowTerminalWorkspaceBranchDeletion`
+      // passed), the branch and its commit must survive.
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await markPastCooldown(seeded);
+      await stampRuntimeOwnedBranch(seeded.executionWorkspaceId);
+
+      const sweep = await pastCooldownService(false).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+      expect(await readGit(seeded.repoRoot, ["rev-parse", "--verify", "refs/heads/PAP-16015-delivery"]))
+        .toBe(seeded.headSha);
+    }, 20_000);
+
+    it("deletes the branch of a clean, merged, past-cooldown workspace only when explicitly opted in", async () => {
+      // Proves the opt-in still works end-to-end: with the flag explicitly
+      // set to `true`, the pre-existing branch-deletion behavior is
+      // available for an operator who deliberately wants it.
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await markPastCooldown(seeded);
+      await stampRuntimeOwnedBranch(seeded.executionWorkspaceId);
+
+      const sweep = await pastCooldownService(true).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"])).toBeNull();
+    }, 20_000);
+  });
+
+  // This reaper reclaims the *worktree* the moment an issue tree is no longer
+  // `in_progress`, with no grace period and no status exceptions —
+  // `done`/`cancelled` included: a worktree removal never touches the branch
+  // or its commits (they stay in the repo's object store), so there is
+  // nothing to lose by reclaiming immediately, even before delivery is
+  // verified. The terminal reaper (`sweepTerminalWorkspaces`) still runs its
+  // own merged-PR verification and cooldown on `done`/`cancelled` workspaces,
+  // but only for its own distinct purpose: it is the sole path allowed to
+  // delete the branch, once delivery is confirmed. The two reapers race
+  // safely on the same per-workspace lifecycle lock; in practice this one
+  // wins first since it has no cooldown.
+  describe("resumable-idle reaper", () => {
+    const nowMs = Date.UTC(2026, 5, 1);
+
+    function resumableIdleService() {
+      return executionWorkspaceService(db, {
+        resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
+        now: () => new Date(nowMs),
+      });
+    }
+
+    async function statusOf(executionWorkspaceId: string) {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row ?? null;
+    }
+
+    // The sweep scans workspaces with `updatedAt <= now()`, using the mocked
+    // `nowMs` above (fixed at 2026-06-01) as its boundary on the very first
+    // call. The real wall clock the test runs under may be later than that
+    // fixed instant, so every seeded row is pinned to `nowMs` to land inside
+    // the scan window regardless of when the test actually executes.
+    async function seedResumableIdleWorkspace(
+      options: Parameters<typeof seedTerminalWorkspace>[0] = {},
+    ) {
+      const seeded = await seedTerminalWorkspace(options);
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      return seeded;
+    }
+
+    it("archives an in_review issue's workspace immediately, without a merged PR", async () => {
+      // No merged PR was ever seeded for this workspace, and no grace period
+      // elapses: this reaper never verifies delivery, unlike the terminal one.
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "in_review" });
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toMatchObject({
+        status: "archived",
+        cleanupReason: "issue_resumable_idle",
+      });
+      // The worktree directory is gone...
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      // ...but the branch and its commit survive: this path never verifies
+      // delivery, so it must never delete the runtime-owned branch.
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+      expect(await readGit(seeded.repoRoot, ["rev-parse", "--verify", "refs/heads/PAP-16015-delivery"]))
+        .toBe(seeded.headSha);
+    }, 20_000);
+
+    it.each(["backlog", "todo", "blocked", "done", "cancelled"] as const)(
+      "archives a %s issue's workspace immediately, without a merged PR",
+      async (sourceIssueStatus) => {
+        const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus });
+
+        const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+        expect(sweep).toMatchObject({ archived: 1 });
+        expect(await statusOf(seeded.executionWorkspaceId)).toMatchObject({
+          status: "archived",
+          cleanupReason: "issue_resumable_idle",
+        });
+        // The worktree directory is gone, but the branch and its commit
+        // survive: this path never verifies delivery (a merged PR is not
+        // even seeded here), so it must never delete the runtime-owned
+        // branch, even for a `done`/`cancelled` issue.
+        await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+        expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+          .toContain("PAP-16015-delivery");
+      },
+      20_000,
+    );
+
+    it("does not touch an in_progress issue's workspace", async () => {
+      // The eligibility rule is a negative check on this one status: an
+      // in_progress source issue is the only one this reaper must leave alone.
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "in_progress" });
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 0, skippedNotResumableIdle: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toMatchObject({ status: "active" });
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("does not delete the runtime-owned branch even when the workspace is marked runtime-owned", async () => {
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "blocked" });
+      await db.update(executionWorkspaces).set({
+        metadata: {
+          createdByRuntime: true,
+          gitBranchOwnershipVersion: 1,
+        },
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+    }, 20_000);
+
+    it("skips a blocked issue's workspace with uncommitted changes", async () => {
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "blocked" });
+      await fs.writeFile(path.join(seeded.worktreePath, "uncommitted.txt"), "dirty\n", "utf8");
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 0, skippedDirty: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toMatchObject({ status: "active" });
+      // The worktree survives on disk with the uncommitted content intact.
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("skips a blocked issue's workspace while a descendant is still in_progress", async () => {
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "blocked", childStatus: "in_progress" });
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 0, skippedNotResumableIdle: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toMatchObject({ status: "active" });
+    }, 20_000);
+
+    it("does not skip a blocked issue's workspace over a done or todo descendant", async () => {
+      // Only an in_progress descendant blocks this reaper; every other status
+      // (including a leftover done or todo child) is fine.
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "blocked", childStatus: "done" });
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+    }, 20_000);
+
+    it("archives a done issue's workspace immediately even when a merged PR exists, without deleting the branch", async () => {
+      // A merged PR is irrelevant to this reaper: it never checks delivery,
+      // and `done`/`cancelled` are no longer excluded from it — the terminal
+      // reaper (`sweepTerminalWorkspaces`) is the only path that may delete
+      // the branch, and only that path requires delivery verification.
+      const seeded = await seedResumableIdleWorkspace({ mergedPr: true });
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toMatchObject({
+        status: "archived",
+        cleanupReason: "issue_resumable_idle",
+      });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+    }, 20_000);
+
+    it("runs a configured teardownCommand when the branch is merged into base, even for an in_review issue", async () => {
+      // Worktree removal and teardownCommand are gated independently: removal
+      // fires for any non-in_progress status, but teardown additionally
+      // requires the branch to be confirmed merged (here via local ancestry,
+      // folded into `main` directly, without any PR involved).
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "in_review" });
+      await runGit(seeded.repoRoot, ["merge", "--no-ff", "-m", "Fold delivery into main", "PAP-16015-delivery"]);
+      const teardownMarker = path.join(path.dirname(seeded.worktreePath), `teardown-marker-${randomUUID()}`);
+      tempDirs.add(teardownMarker);
+      await db.update(executionWorkspaces).set({
+        metadata: {
+          createdByRuntime: true,
+          config: { teardownCommand: `touch ${teardownMarker}` },
+        },
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      // Merged into base or not, this reaper never deletes the branch.
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+      await expect(fs.access(teardownMarker)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("does not run a configured teardownCommand when the branch's merge state cannot be confirmed (fails closed)", async () => {
+      // Same in_review issue and teardownCommand as above, but the branch is
+      // never folded into main and no merged PR is seeded, so PR lookups
+      // resolve to "unknown" (see `resolvePullRequestDetails` above). Removal
+      // still happens; teardown must not, since merge state is unconfirmed.
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "in_review" });
+      const teardownMarker = path.join(path.dirname(seeded.worktreePath), `teardown-marker-${randomUUID()}`);
+      tempDirs.add(teardownMarker);
+      await db.update(executionWorkspaces).set({
+        metadata: {
+          createdByRuntime: true,
+          config: { teardownCommand: `touch ${teardownMarker}` },
+        },
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      await expect(fs.access(teardownMarker)).rejects.toThrow();
+    }, 20_000);
+
+    it("does not re-run a teardownCommand that already completed on a prior cleanup pass", async () => {
+      // Simulates a reopen-then-re-close cycle: `teardownCompletedAt` survives a
+      // reopen (`bumpExecutionWorkspaceLifecycleGeneration` and
+      // `setMetadataReopenPendingConsumption` both merge over existing metadata
+      // rather than replacing it), so a later cleanup pass for a branch that was
+      // already torn down must see the stamp and skip running the command again
+      // — arbitrary user shell should not run twice just because the task
+      // resumed and stopped again with nothing new to tear down.
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "in_review" });
+      await runGit(seeded.repoRoot, ["merge", "--no-ff", "-m", "Fold delivery into main", "PAP-16015-delivery"]);
+      const teardownMarker = path.join(path.dirname(seeded.worktreePath), `teardown-marker-${randomUUID()}`);
+      tempDirs.add(teardownMarker);
+      await db.update(executionWorkspaces).set({
+        metadata: {
+          createdByRuntime: true,
+          config: { teardownCommand: `touch ${teardownMarker}` },
+          [EXECUTION_WORKSPACE_TEARDOWN_COMPLETED_AT_METADATA_KEY]: new Date().toISOString(),
+        },
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await resumableIdleService().sweepResumableIdleWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      // Worktree removal is unaffected by teardown idempotency: it still runs.
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      // But the already-completed teardown command never runs again.
+      await expect(fs.access(teardownMarker)).rejects.toThrow();
+    }, 20_000);
+
+    it("does not write stale cleanup-failure state onto a newer archive lifecycle", async () => {
+      // Ports the terminal reaper's own race test (below, in the terminal
+      // reaper's describe block) onto this reaper: `fenceLifecycleGenerationWrite`
+      // is shared fencing code used by both `sweepTerminalWorkspaces` and
+      // `sweepResumableIdleWorkspaces`, but until now only the terminal path
+      // exercised it. This reaper archives the workspace at one generation and
+      // captures it, cleanup then throws (standing in for the worktree having
+      // moved out from under it), and — before the catch handler can write the
+      // cleanup-failed status — a reopen and a fresh archive raise the
+      // generation. The catch handler's own fenced write must see the newer
+      // generation and skip, so the stale failure never overwrites the newer
+      // archive lifecycle the "reopen" produced.
+      const seeded = await seedResumableIdleWorkspace({ sourceIssueStatus: "blocked" });
+      const newerReason = "newer_archive_lifecycle_marker";
+      const racingService = executionWorkspaceService(db, {
+        resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
+        now: () => new Date(nowMs),
+        beforeTerminalWorkspaceCleanup: async (workspace) => {
+          await db
+            .update(executionWorkspaces)
+            .set({
+              status: "archived",
+              cleanupReason: newerReason,
+              metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 2 },
+              updatedAt: new Date(nowMs),
+            })
+            .where(eq(executionWorkspaces.id, workspace.id));
+          throw new Error("forced cleanup failure");
+        },
+      });
+
+      const sweep = await racingService.sweepResumableIdleWorkspaces();
+      const [workspace] = await db
+        .select({
+          status: executionWorkspaces.status,
+          cleanupReason: executionWorkspaces.cleanupReason,
+          metadata: executionWorkspaces.metadata,
+        })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      expect(sweep).toMatchObject({ cleanupFailed: 1 });
+      // The fenced write saw the raised generation and skipped, so the newer
+      // lifecycle state survives untouched.
+      expect(workspace?.status).toBe("archived");
+      expect(workspace?.cleanupReason).toBe(newerReason);
+      expect(
+        (workspace?.metadata as Record<string, unknown> | null)?.[EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY],
+      ).toBe(2);
+    }, 20_000);
+  });
+
+  // A workspace's `sourceIssueId` goes null when its issue is hard-deleted
+  // (`source_issue_id` is `ON DELETE SET NULL`; see
+  // `packages/db/src/schema/execution_workspaces.ts`). Neither
+  // `sweepTerminalWorkspaces` nor `sweepResumableIdleWorkspaces` ever selects
+  // such a row — both candidate queries require an issue to read a status
+  // from — so without this reaper the workspace, and its worktree, leaks
+  // forever. This reaper only ever removes the worktree directory: with no
+  // issue left, there is no way to derive a merge state, so it always fails
+  // closed on `teardownCommand` and never deletes the branch.
+  describe("orphan reaper", () => {
+    const nowMs = Date.UTC(2026, 5, 1);
+
+    function orphanService() {
+      return executionWorkspaceService(db, {
+        resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
+        now: () => new Date(nowMs),
+      });
+    }
+
+    // Simulates the post-hard-delete state directly (a plain metadata/column
+    // update), rather than actually deleting the issue row and relying on the
+    // `ON DELETE SET NULL` cascade to fire. This exercises exactly the
+    // precondition `sweepOrphanedWorkspaces` selects on (`sourceIssueId IS
+    // NULL`) without depending on the migration's cascade wiring, which is a
+    // separate concern from this reaper's own selection/cleanup logic.
+    async function orphan(executionWorkspaceId: string) {
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: null, updatedAt: new Date(nowMs) })
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    }
+
+    it("reclaims an orphaned workspace's worktree, preserving the branch, without a source issue", async () => {
+      // `sourceIssueStatus: "in_progress"` is deliberate: this reaper never
+      // reads a leftover issue's status (it selects purely on `sourceIssueId
+      // IS NULL`), so even a residual "in_progress" issue row must not matter
+      // once the workspace's own pointer to it has gone null.
+      const seeded = await seedTerminalWorkspace({ sourceIssueStatus: "in_progress" });
+      await orphan(seeded.executionWorkspaceId);
+
+      const sweep = await orphanService().sweepOrphanedWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      const [workspace] = await db
+        .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_orphaned" });
+      // The worktree directory is gone...
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      // ...but the branch and its commit survive: there is no issue left to
+      // derive a merge state from, so this path never deletes the branch.
+      expect(await readGit(seeded.repoRoot, ["branch", "--list", "PAP-16015-delivery"]))
+        .toContain("PAP-16015-delivery");
+      expect(await readGit(seeded.repoRoot, ["rev-parse", "--verify", "refs/heads/PAP-16015-delivery"]))
+        .toBe(seeded.headSha);
+    }, 20_000);
+
+    it("never runs a configured teardownCommand for an orphaned workspace, even with a merged branch", async () => {
+      // With no issue left, merge state can never be positively confirmed, so
+      // this reaper always passes `branchMerged: false` and must fail closed
+      // on teardown regardless of the branch's actual git ancestry.
+      const seeded = await seedTerminalWorkspace({ sourceIssueStatus: "in_progress" });
+      await runGit(seeded.repoRoot, ["merge", "--no-ff", "-m", "Fold delivery into main", "PAP-16015-delivery"]);
+      await orphan(seeded.executionWorkspaceId);
+      const teardownMarker = path.join(path.dirname(seeded.worktreePath), `teardown-marker-${randomUUID()}`);
+      tempDirs.add(teardownMarker);
+      await db.update(executionWorkspaces).set({
+        metadata: {
+          createdByRuntime: true,
+          config: { teardownCommand: `touch ${teardownMarker}` },
+        },
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await orphanService().sweepOrphanedWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1 });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      await expect(fs.access(teardownMarker)).rejects.toThrow();
+    }, 20_000);
+
+    it("does not remove an orphaned workspace's worktree while it has uncommitted changes", async () => {
+      const seeded = await seedTerminalWorkspace({ sourceIssueStatus: "in_progress" });
+      await orphan(seeded.executionWorkspaceId);
+      await fs.writeFile(path.join(seeded.worktreePath, "untracked.txt"), "wip\n", "utf8");
+
+      const sweep = await orphanService().sweepOrphanedWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 0, skippedDirty: 1 });
+      const [workspace] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect(workspace?.status).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("does not reclaim an orphaned workspace still bound to an active run", async () => {
+      const seeded = await seedTerminalWorkspace({ sourceIssueStatus: "in_progress", activeRun: true });
+      await orphan(seeded.executionWorkspaceId);
+
+      const sweep = await orphanService().sweepOrphanedWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 0, skippedActiveRun: 1 });
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+  });
+
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
     const seeded = await seedTerminalWorkspace();
     const unrelatedIssueId = randomUUID();
@@ -1159,6 +1682,34 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(workspace?.status).toBe("archived");
     await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
     await expect(fs.access(cleanupMarker)).rejects.toThrow();
+  });
+
+  it("runs a configured teardownCommand once the delivered PR is confirmed merged", async () => {
+    // Unlike `cleanupCommand` above, `teardownCommand` is independently gated
+    // on the merge check this reaper already performs to decide whether it
+    // may archive at all (its own eligibility requires `merged_via_pr` or
+    // `merged_by_ancestry`), so teardown fires here even though
+    // `runCleanupCommands: false` keeps `cleanupCommand` suppressed.
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const teardownMarker = path.join(path.dirname(seeded.worktreePath), `teardown-marker-${randomUUID()}`);
+    tempDirs.add(teardownMarker);
+    await db.update(executionWorkspaces).set({
+      metadata: {
+        createdByRuntime: true,
+        config: { teardownCommand: `touch ${teardownMarker}` },
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    expect(workspace?.status).toBe("archived");
+    await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    await expect(fs.access(teardownMarker)).resolves.toBeUndefined();
   });
 
   it("does not reap a reopened workspace while the source issue is still terminal", async () => {
@@ -1738,6 +2289,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   });
 
   it("holds Git index and ref locks across terminal cleanup", async () => {
+    // This test exercises the branch-deletion lock path specifically, so it
+    // explicitly opts into `allowTerminalWorkspaceBranchDeletion` (off by
+    // default everywhere else — see the "branch deletion" describe block
+    // below for the default-off behavior itself).
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db.update(executionWorkspaces).set({
       metadata: {
@@ -1751,6 +2306,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       resolvePullRequestDetails: async (_companyId, reference) =>
         pullRequestDetailsByKey.get(`${seeded.companyId}:${reference.number}`) ?? { state: "unknown" },
       workspaceReaperCooldownDays: 0,
+      allowTerminalWorkspaceBranchDeletion: true,
       beforeTerminalWorkspaceCleanup: async () => {
         try {
           await runGit(seeded.worktreePath, ["commit", "--allow-empty", "-m", "Late commit"]);
