@@ -197,6 +197,33 @@ write_plist() {
   mkdir -p "$AGENTS_DIR"
   local run_logs_script="${PAPERCLIP_RUN_LOGS_PRUNE_SCRIPT:-}"
   local backup_script="${PAPERCLIP_BACKUP_RETENTION_SCRIPT:-}"
+
+  # Only emit the EnvironmentVariables block — and only the specific keys
+  # that are actually set — when at least one hook script path was
+  # provided. Previously this always wrote both keys, defaulting to empty
+  # strings when unset, which produced a plist with two permanently-dead
+  # hooks (an empty PAPERCLIP_RUN_LOGS_PRUNE_SCRIPT/PAPERCLIP_BACKUP_RETENTION_SCRIPT
+  # silently satisfies neither `-n` check in the runner, so they never fire
+  # and never visibly indicate they're disabled).
+  local env_block=""
+  if [[ -n "$run_logs_script" || -n "$backup_script" ]]; then
+    env_block="  <key>EnvironmentVariables</key>
+  <dict>"
+    if [[ -n "$run_logs_script" ]]; then
+      env_block="$env_block
+    <key>PAPERCLIP_RUN_LOGS_PRUNE_SCRIPT</key>
+    <string>$run_logs_script</string>"
+    fi
+    if [[ -n "$backup_script" ]]; then
+      env_block="$env_block
+    <key>PAPERCLIP_BACKUP_RETENTION_SCRIPT</key>
+    <string>$backup_script</string>"
+    fi
+    env_block="$env_block
+  </dict>
+"
+  fi
+
   cat > "$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -218,14 +245,7 @@ write_plist() {
   <string>$LOG_DIR/stdout.log</string>
   <key>StandardErrorPath</key>
   <string>$LOG_DIR/stderr.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PAPERCLIP_RUN_LOGS_PRUNE_SCRIPT</key>
-    <string>$run_logs_script</string>
-    <key>PAPERCLIP_BACKUP_RETENTION_SCRIPT</key>
-    <string>$backup_script</string>
-  </dict>
-</dict>
+$env_block</dict>
 </plist>
 PLIST
 }
