@@ -269,6 +269,11 @@ const exposurePortPairClaims = new ExposurePortPairClaims();
  */
 const OPEN_EXECUTION_WORKSPACE_LEASE_STATUSES = ["active", "idle", "in_review"] as const;
 const DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES = 256 * 1024;
+// After `executeProcess`'s `timeoutMs` elapses, SIGTERM is sent first so a
+// well-behaved command can shut down cleanly; SIGKILL follows after this grace
+// period only if the process is still alive, so a command that ignores
+// SIGTERM cannot wedge the caller indefinitely.
+const EXECUTE_PROCESS_KILL_GRACE_MS = 10_000;
 export const WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS = 32;
 const ACTIVE_RUNTIME_PORT_RESERVATION_STATUSES = ["provisioning", "starting", "running"] as const;
 const DEFAULT_TAILSCALE_BROKER_SOCKET = "/run/paperclip-tailscale-broker/broker.sock";
@@ -861,6 +866,21 @@ async function executeProcess(input: {
   env?: NodeJS.ProcessEnv;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
+  // When set, the process is killed (SIGTERM, then SIGKILL after
+  // `EXECUTE_PROCESS_KILL_GRACE_MS`) if it has not exited within this many
+  // milliseconds, and the returned promise rejects with a timeout error. Only
+  // callers that opt in are affected; omitting it preserves the previous
+  // unbounded behavior.
+  //
+  // Setting a `timeoutMs` also spawns the child detached, as its own process
+  // group leader, and the timeout kill signals target the whole group
+  // (`process.kill(-pid, signal)`) rather than just the direct child. A
+  // shell command such as `sh -c "cmd1 && cmd2 &"` can spawn grandchildren
+  // that outlive a plain SIGKILL to the direct child; killing the group
+  // reaches them too. This only changes behavior for a caller that opts into
+  // a timeout — a caller that omits `timeoutMs` still spawns exactly as
+  // before.
+  timeoutMs?: number | null;
 }): Promise<{
   stdout: string;
   stderr: string;
@@ -870,29 +890,77 @@ async function executeProcess(input: {
   stdoutBytes: number;
   stderrBytes: number;
 }> {
+  const timeoutEnabled = input.timeoutMs != null && input.timeoutMs > 0;
+  // Match the `detached: process.platform !== "win32"` convention used
+  // elsewhere in this file for process-group-killable children: Windows has
+  // no negative-pid process-group kill, so detaching there would only add
+  // console-handling differences without buying anything.
+  const spawnDetached = timeoutEnabled && process.platform !== "win32";
   const proc = await new Promise<{
     stdout: ProcessOutputAccumulator;
     stderr: ProcessOutputAccumulator;
     code: number | null;
+    timedOut: boolean;
   }>((resolve, reject) => {
     const child = spawn(input.command, input.args, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: input.env ?? process.env,
+      detached: spawnDetached,
     });
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      if (child.pid == null) return;
+      try {
+        if (spawnDetached) {
+          // A negative pid targets the whole process group. This only works
+          // because the child was spawned `detached` above.
+          process.kill(-child.pid, signal);
+          return;
+        }
+        child.kill(signal);
+      } catch {
+        // The group (or the process itself) may already be gone: it exited
+        // between the timer firing and this call. Nothing left to signal.
+      }
+    };
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
+    let timedOut = false;
+    let killTimer: NodeJS.Timeout | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    if (timeoutEnabled) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        killProcessGroup("SIGTERM");
+        killTimer = setTimeout(() => {
+          killProcessGroup("SIGKILL");
+        }, EXECUTE_PROCESS_KILL_GRACE_MS);
+        killTimer.unref?.();
+      }, input.timeoutMs!);
+      timeoutTimer.unref?.();
+    }
     child.stdout?.on("data", (chunk) => {
       stdout.append(String(chunk));
     });
     child.stderr?.on("data", (chunk) => {
       stderr.append(String(chunk));
     });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ stdout, stderr, code }));
+    child.on("error", (err) => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ stdout, stderr, code, timedOut });
+    });
   });
   const stdout = proc.stdout.finish();
   const stderr = proc.stderr.finish();
+  if (proc.timedOut) {
+    throw new Error(`Command "${input.command} ${input.args.join(" ")}" timed out after ${input.timeoutMs}ms and was killed`);
+  }
   return {
     stdout: stdout.text,
     stderr: stderr.text,
@@ -2944,6 +3012,7 @@ async function runWorkspaceCommand(input: {
   env: NodeJS.ProcessEnv;
   label: string;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  timeoutMs?: number | null;
 }) {
   const shell = resolveShell();
   const proc = await executeProcess({
@@ -2951,6 +3020,7 @@ async function runWorkspaceCommand(input: {
     args: ["-c", input.resolvedCommand ?? input.command],
     cwd: input.cwd,
     env: input.env,
+    timeoutMs: input.timeoutMs,
   });
   if (proc.stdout && input.onLog) await input.onLog("stdout", `[runtime-provision] ${proc.stdout}`);
   if (proc.stderr && input.onLog) await input.onLog("stderr", `[runtime-provision] ${proc.stderr}`);
@@ -3038,6 +3108,8 @@ async function recordWorkspaceCommandOperation(
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    // Forwarded to `executeProcess`. See its `timeoutMs` doc comment.
+    timeoutMs?: number | null;
   },
 ) {
   if (!recorder) {
@@ -3060,6 +3132,7 @@ async function recordWorkspaceCommandOperation(
         args: ["-c", input.resolvedCommand ?? input.command],
         cwd: input.cwd,
         env: input.env,
+        timeoutMs: input.timeoutMs,
       });
       const seedEvidence = input.phase === "workspace_seed"
         ? readWorkspaceSeedOperationEvidence(input.cwd)
@@ -4027,7 +4100,31 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   beforeBranchDelete?: (() => Promise<void>) | null;
   expectedBranchHeadSha?: string | null;
   runCleanupCommands?: boolean;
+  // Independently gates whether `teardownCommand` runs, separate from
+  // `runCleanupCommands` (which gates `cleanupCommand` /
+  // `projectWorkspace.cleanupCommand` only). Defaults to mirroring
+  // `runCleanupCommands` when omitted, so the existing callers that never
+  // pass either flag (the manual "destroy workspace" route and the
+  // provisioning-failure rollback path) keep running both commands together,
+  // exactly as before. A caller that wants `cleanupCommand` suppressed but
+  // `teardownCommand` gated on its own condition (for example, the automatic
+  // reaper, which gates teardown on a merged branch regardless of issue
+  // status) passes `runCleanupCommands: false` and an explicit
+  // `runTeardownCommand` value.
+  runTeardownCommand?: boolean;
+  // Bounds how long `teardownCommand` may run; forwarded to `executeProcess`.
+  // Only applies to `teardownCommand`, not `cleanupCommand`.
+  teardownCommandTimeoutMs?: number | null;
   forceWorktreeRemoval?: boolean;
+  // Gates git branch deletion independently of `branchCreatedByRuntime` below.
+  // Removing a git worktree is safe (the branch and its commits stay in the
+  // repo's object store), but deleting the branch is only safe when the caller
+  // already verified the work was delivered (merged). Defaults to `true` to
+  // preserve existing behavior for callers that already gate on delivery
+  // verification. A caller that reclaims a workspace without delivery
+  // verification (for example, an idle `blocked`/`in_review` issue) must pass
+  // `false` so the branch (and any commit reachable only from it) survives.
+  deleteBranch?: boolean;
 }) {
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
@@ -4061,17 +4158,28 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   // their worktrees are removable, but their branch refs are operator-owned.
   const createdByRuntime = input.workspace.metadata?.createdByRuntime === true;
   const branchCreatedByRuntime = isRuntimeOwnedGitBranch(input.workspace.metadata);
-  const cleanupCommands = input.runCleanupCommands === false
-    ? []
-    : [
-        input.cleanupCommand ?? null,
-        input.projectWorkspace?.cleanupCommand ?? null,
-        input.teardownCommand ?? null,
-      ]
-        .map((value) => asString(value, "").trim())
-        .filter(Boolean);
+  // `cleanupCommand` / `projectWorkspace.cleanupCommand` stay gated by
+  // `runCleanupCommands` alone (default: enabled unless explicitly `false`).
+  // `teardownCommand` gets its own gate, `runTeardownCommand`, defaulting to
+  // mirror `runCleanupCommands`'s effective value when omitted — see the
+  // `runTeardownCommand` doc comment above.
+  const generalCleanupEnabled = input.runCleanupCommands !== false;
+  const teardownEnabled = input.runTeardownCommand ?? generalCleanupEnabled;
+  const cleanupCommands = [
+    ...(generalCleanupEnabled
+      ? [
+          { raw: input.cleanupCommand ?? null, timeoutMs: null as number | null },
+          { raw: input.projectWorkspace?.cleanupCommand ?? null, timeoutMs: null as number | null },
+        ]
+      : []),
+    ...(teardownEnabled
+      ? [{ raw: input.teardownCommand ?? null, timeoutMs: input.teardownCommandTimeoutMs ?? null }]
+      : []),
+  ]
+    .map((entry) => ({ command: asString(entry.raw, "").trim(), timeoutMs: entry.timeoutMs }))
+    .filter((entry) => entry.command.length > 0);
 
-  for (const command of cleanupCommands) {
+  for (const { command, timeoutMs } of cleanupCommands) {
     try {
       const resolvedCommand = repoRoot
         ? resolveRepoManagedWorkspaceCommand(command, repoRoot)
@@ -4091,6 +4199,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
           resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
         },
         successMessage: `Completed cleanup command "${command}"\n`,
+        timeoutMs,
       });
     } catch (err) {
       warnings.push(err instanceof Error ? err.message : String(err));
@@ -4147,7 +4256,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         }
       }
     }
-    if (branchCreatedByRuntime && input.workspace.branchName) {
+    if (input.deleteBranch !== false && branchCreatedByRuntime && input.workspace.branchName) {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root to delete branch "${input.workspace.branchName}".`);
       } else {
@@ -4225,6 +4334,85 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     cleaned,
     warnings,
   };
+}
+
+// Run a single, already-claimed `teardownCommand` standalone, outside
+// `cleanupExecutionWorkspaceArtifacts` and outside any DB transaction or
+// advisory lock. `cleanupTerminalWorkspace` (execution-workspaces.ts) calls
+// this after its lifecycle-lock transaction commits: the transaction removes
+// the worktree directory and stamps a teardown claim in the same write, then
+// releases the lock, then this function actually runs the command. Splitting
+// it out this way means a slow or hanging `teardownCommand` (bounded by
+// `timeoutMs`, but user-supplied shell commands are exactly the kind of thing
+// that can still take a while) never holds the per-workspace Postgres
+// advisory lock or a pooled connection, so it cannot block a concurrent
+// reopen of the same workspace the way running it inside that transaction
+// would.
+//
+// Because the worktree directory is already gone by the time this runs, this
+// cannot use it as the command's cwd or as the source for resolving a
+// `./relative` repo-managed script (unlike `cleanupCommand`, which still runs
+// with the worktree in place inside `cleanupExecutionWorkspaceArtifacts`
+// above). It falls back to the project workspace's cwd for both, the same
+// fallback `cleanupExecutionWorkspaceArtifacts` already uses when there is no
+// workspace path; `resolveGitRepoRootForWorkspaceCleanup` already prefers the
+// project workspace cwd over the worktree path, so this degrades gracefully
+// even when the workspace never had a linked project workspace.
+export async function runClaimedTeardownCommand(input: {
+  workspace: {
+    id: string;
+    cwd: string | null;
+    providerType: string;
+    providerRef: string | null;
+    branchName: string | null;
+    repoUrl: string | null;
+    baseRef: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    sourceIssueId: string | null;
+    metadata?: Record<string, unknown> | null;
+  };
+  command: string;
+  projectWorkspaceCwd?: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  // Forwarded to `executeProcess`. A hanging command is killed
+  // (SIGTERM, then SIGKILL) rather than left to run indefinitely.
+  timeoutMs?: number | null;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
+  const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
+    ? await resolveGitRepoRootForWorkspaceCleanup(workspacePath, input.projectWorkspaceCwd ?? null)
+    : null;
+  const cleanupEnv = buildExecutionWorkspaceCleanupEnv({
+    workspace: input.workspace,
+    projectWorkspaceCwd: input.projectWorkspaceCwd ?? null,
+  });
+  const resolvedCommand = repoRoot
+    ? resolveRepoManagedWorkspaceCommand(input.command, repoRoot)
+    : input.command;
+  const cwd = input.projectWorkspaceCwd ?? process.cwd();
+  try {
+    await recordWorkspaceCommandOperation(input.recorder, {
+      phase: "workspace_teardown",
+      command: input.command,
+      resolvedCommand,
+      cwd,
+      env: cleanupEnv,
+      label: `Execution workspace teardown command "${input.command}"`,
+      metadata: {
+        workspaceId: input.workspace.id,
+        workspacePath,
+        branchName: input.workspace.branchName,
+        providerType: input.workspace.providerType,
+        resolvedCommand: resolvedCommand === input.command ? null : resolvedCommand,
+      },
+      successMessage: `Completed teardown command "${input.command}"\n`,
+      timeoutMs: input.timeoutMs ?? null,
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**

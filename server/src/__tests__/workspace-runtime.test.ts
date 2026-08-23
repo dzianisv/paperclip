@@ -3982,6 +3982,105 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
     await fs.rm(worktreesDir, { recursive: true, force: true });
   });
+
+  // Minimal workspace stub for tests that only exercise the `cleanupCommands`
+  // gating/execution logic (`runCleanupCommands` / `runTeardownCommand` /
+  // `teardownCommandTimeoutMs`), not worktree or branch removal. A
+  // `providerType` that matches neither `git_worktree` nor `local_fs`, with a
+  // null `cwd`/`providerRef`, means `workspacePath` stays null, so the
+  // worktree/branch-deletion code paths never engage and `cleaned` is always
+  // `true` regardless of command outcome.
+  function commandOnlyWorkspaceStub() {
+    return {
+      id: "execution-workspace-1",
+      cwd: null,
+      providerType: "none",
+      providerRef: null,
+      branchName: null,
+      repoUrl: null,
+      baseRef: null,
+      projectId: null,
+      projectWorkspaceId: null,
+      sourceIssueId: null,
+      metadata: null,
+    };
+  }
+
+  it("runs teardownCommand independent of cleanupCommand when runTeardownCommand is explicitly true", async () => {
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: commandOnlyWorkspaceStub(),
+      cleanupCommand: "printf 'cleanup ran\\n'",
+      teardownCommand: "printf 'teardown ran\\n'",
+      // The automatic reaper's shape: cleanupCommand stays out of scope, only
+      // the independently-gated teardownCommand runs.
+      runCleanupCommands: false,
+      runTeardownCommand: true,
+      recorder,
+    });
+
+    expect(cleanup.warnings).toEqual([]);
+    expect(operations).toHaveLength(1);
+    expect(operations[0]?.command).toBe("printf 'teardown ran\\n'");
+  });
+
+  it("does not run teardownCommand when runTeardownCommand is false, even with a command configured", async () => {
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: commandOnlyWorkspaceStub(),
+      teardownCommand: "printf 'should not run\\n'",
+      runCleanupCommands: false,
+      runTeardownCommand: false,
+      recorder,
+    });
+
+    expect(cleanup.warnings).toEqual([]);
+    expect(operations).toHaveLength(0);
+  });
+
+  it("defaults runTeardownCommand to runCleanupCommands's value so the manual destroy route and heartbeat rollback are unaffected", async () => {
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    // Neither `runCleanupCommands` nor `runTeardownCommand` is passed, matching
+    // the two pre-existing production callers (`routes/execution-workspaces.ts`
+    // and the provisioning-failure rollback in `heartbeat.ts`).
+    await cleanupExecutionWorkspaceArtifacts({
+      workspace: commandOnlyWorkspaceStub(),
+      cleanupCommand: "printf 'cleanup ran\\n'",
+      teardownCommand: "printf 'teardown ran\\n'",
+      recorder,
+    });
+
+    expect(operations.map((operation) => operation.command)).toEqual([
+      "printf 'cleanup ran\\n'",
+      "printf 'teardown ran\\n'",
+    ]);
+  });
+
+  it("kills a hanging teardownCommand after teardownCommandTimeoutMs and records the failure as a warning without throwing", async () => {
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: commandOnlyWorkspaceStub(),
+      teardownCommand: "sleep 30",
+      runCleanupCommands: false,
+      runTeardownCommand: true,
+      teardownCommandTimeoutMs: 200,
+      recorder,
+    });
+
+    // The timeout throws inside `run()`, before the double records the
+    // operation, so `cleanupExecutionWorkspaceArtifacts`'s own per-command
+    // try/catch is what turns it into a warning instead of a thrown error.
+    expect(operations).toHaveLength(0);
+    expect(cleanup.warnings).toHaveLength(1);
+    expect(cleanup.warnings[0]).toMatch(/timed out/i);
+    // Worktree removal (a no-op here, since there is no workspacePath) is
+    // unaffected by the teardown failure.
+    expect(cleanup.cleaned).toBe(true);
+  }, 8_000);
 });
 
 describe("ensureRuntimeServicesForRun", () => {
