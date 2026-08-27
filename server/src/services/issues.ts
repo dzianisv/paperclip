@@ -7676,6 +7676,27 @@ export function issueService(db: Db) {
         updatedAt: new Date(),
       };
       if (existing.status !== "blocked" && issueData.status === "blocked") {
+        // A blocked issue must name who wakes it and with what action, otherwise nothing
+        // ever will: deliverAgentUnblockNotification() no-ops without an unblockDescriptor,
+        // and blockerAttention is derived at read time, so an issue parked with neither an
+        // unresolved blocker edge nor a descriptor resolves its terminal blocker to itself
+        // and sleeps forever. This is the same class of invariant as "in_progress issues
+        // require an assignee" below.
+        const nextUnblockDescriptor =
+          issueData.unblockDescriptor !== undefined
+            ? issueData.unblockDescriptor
+            : existing.unblockDescriptor;
+        if (!nextUnblockDescriptor) {
+          const blockedByForTransition = blockedByIssueIds !== undefined
+            ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
+            : (await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id])).get(id)
+                ?.unresolvedBlockerIssueIds ?? [];
+          if (blockedByForTransition.length === 0) {
+            throw unprocessable(
+              "blocked issues require an unresolved blocker or an unblockDescriptor naming the owner and the action that will unblock them",
+            );
+          }
+        }
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
       } else if (existing.status === "blocked" && issueData.status && issueData.status !== "blocked") {
