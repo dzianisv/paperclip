@@ -13,6 +13,7 @@ function counterDb(
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
+  const updated: Array<Record<string, unknown>> = [];
   const tx = {
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
@@ -37,27 +38,26 @@ function counterDb(
         },
       }),
     }),
+    update: () => ({
+      set: (value: Record<string, unknown>) => ({
+        where: async () => {
+          updated.push(value);
+        },
+      }),
+    }),
     insert: () => ({
       values: async (value: Record<string, unknown>) => {
         inserted.push(value);
         if (value.action === "issue.cross_issue_influence_observed") observedCount += 1;
       },
     }),
-    update: () => ({
-      set: (value: Record<string, unknown>) => ({
-        where: async () => {
-          updates.push(value);
-        },
-      }),
-    }),
   };
-  const updates: Array<Record<string, unknown>> = [];
   return {
     db: {
       transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx),
     },
     inserted,
-    updates,
+    updated,
     get observedCount() {
       return observedCount;
     },
@@ -207,7 +207,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("binds an unbound run to its first write target instead of failing closed (AGE-2030)", async () => {
+  it("binds the run's source issue on the first write instead of rejecting, and does not count it against the cap", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -218,15 +218,47 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
     })).resolves.toBeNull();
     expect(fake.inserted).toEqual([]);
-    expect(fake.updates).toEqual([
-      { contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" } },
+    expect(fake.updated).toEqual([
+      expect.objectContaining({
+        contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555", source: "first_write_bind" },
+      }),
     ]);
   });
 
-  it("does not re-reject a second write to the same target after binding (AGE-2030)", async () => {
-    // Once bound, the run behaves like any same-issue run: subsequent writes to
-    // the same target are free same-issue writes, not counted against the cap.
-    const fake = counterDb(0, { contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" } });
+  it("merges the bind into an existing populated contextSnapshot instead of replacing it", async () => {
+    const fake = counterDb(0, {
+      contextSnapshot: {
+        wakeReason: "heartbeat_timer",
+        modelProfile: "reasoning-high",
+        taskKey: "inbox-lite",
+        forceFreshSession: true,
+      },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+    expect(fake.updated).toEqual([
+      expect.objectContaining({
+        contextSnapshot: {
+          wakeReason: "heartbeat_timer",
+          modelProfile: "reasoning-high",
+          taskKey: "inbox-lite",
+          forceFreshSession: true,
+          issueId: "55555555-5555-4555-8555-555555555555",
+          source: "first_write_bind",
+        },
+      }),
+    ]);
+  });
+
+  it("binds a null contextSnapshot the same way as an empty one", async () => {
+    const fake = counterDb(0, { contextSnapshot: null });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
@@ -235,6 +267,22 @@ describe("cross-issue influence limit rollout", () => {
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "comment",
     })).resolves.toBeNull();
-    expect(fake.inserted).toEqual([]);
+    expect(fake.updated).toHaveLength(1);
+  });
+
+  it("gates a write to a different issue by the existing cap after the run is already bound", async () => {
+    const fake = counterDb(0, {
+      contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555", source: "first_write_bind" },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "66666666-6666-4666-8666-666666666666",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
+    expect(fake.updated).toEqual([]);
   });
 });
