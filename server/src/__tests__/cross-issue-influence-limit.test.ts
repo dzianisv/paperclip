@@ -43,12 +43,21 @@ function counterDb(
         if (value.action === "issue.cross_issue_influence_observed") observedCount += 1;
       },
     }),
+    update: () => ({
+      set: (value: Record<string, unknown>) => ({
+        where: async () => {
+          updates.push(value);
+        },
+      }),
+    }),
   };
+  const updates: Array<Record<string, unknown>> = [];
   return {
     db: {
       transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx),
     },
     inserted,
+    updates,
     get observedCount() {
       return observedCount;
     },
@@ -198,7 +207,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("binds an unbound run to its first write target instead of failing closed (AGE-2030)", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -207,10 +216,25 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
-    });
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+    expect(fake.updates).toEqual([
+      { contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" } },
+    ]);
+  });
+
+  it("does not re-reject a second write to the same target after binding (AGE-2030)", async () => {
+    // Once bound, the run behaves like any same-issue run: subsequent writes to
+    // the same target are free same-issue writes, not counted against the cap.
+    const fake = counterDb(0, { contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" } });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).resolves.toBeNull();
     expect(fake.inserted).toEqual([]);
   });
 });
