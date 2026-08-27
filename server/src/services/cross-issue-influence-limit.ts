@@ -109,8 +109,26 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      // A run's very first write can never have a pre-existing source issue to
+      // compare against (e.g. an unscoped heartbeat wake whose contextSnapshot
+      // never got an issueId written to it, or a checkout route that only
+      // patches a newly spawned wakeup run for a *different* actor). Treat this
+      // as "not yet bound" and bind the run to the current target instead of
+      // rejecting unconditionally -- see AGE-2030.
+      const boundSnapshot = {
+        ...(run.contextSnapshot && typeof run.contextSnapshot === "object" && !Array.isArray(run.contextSnapshot)
+          ? (run.contextSnapshot as Record<string, unknown>)
+          : {}),
+        issueId: input.targetIssueId,
+      };
+      await tx.update(heartbeatRuns)
+        .set({ contextSnapshot: boundSnapshot })
+        .where(eq(heartbeatRuns.id, input.runId));
+      sourceIssueId = input.targetIssueId;
+      return null;
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
