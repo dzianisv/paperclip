@@ -3965,6 +3965,58 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(blockedRelations.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
   });
 
+  // Regression (phantom self-block): a `blocked` status with zero blocker edges
+  // strands the issue forever — agents skip it (looks blocked) and the unstick
+  // watchdog skips it (looks covered). 13 such issues wedged the AGE board.
+  it("refuses to transition an issue to blocked when it has no blocker edges", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const lonelyId = randomUUID();
+    await db.insert(issues).values({
+      id: lonelyId,
+      companyId,
+      title: "No blockers",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await expect(svc.update(lonelyId, { status: "blocked" })).rejects.toThrow(
+      /cannot be set to blocked with no blockers/i,
+    );
+
+    const after = await svc.getById(lonelyId);
+    expect(after?.status).toBe("todo");
+  });
+
+  it("allows blocked once a real blocker edge exists", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "high" },
+      { id: blockedId, companyId, title: "Dependent", status: "todo", priority: "medium" },
+    ]);
+
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+    await svc.update(blockedId, { status: "blocked" });
+
+    const after = await svc.getById(blockedId);
+    expect(after?.status).toBe("blocked");
+  });
+
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({

@@ -1577,9 +1577,21 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         if (blockerAttention?.state !== "stalled" && blockerAttention?.state !== "needs_attention") continue;
         if (blockerAttention.blockingTreeLive) continue;
         const issueSummary = blockedIssueSummaries.get(issue.id) ?? null;
-        const terminalIssueId = blockerAttention.terminalBlockerIssueId ?? issue.id;
-        const terminalSummary = terminalBlockerSummaries.get(terminalIssueId)
-          ?? (terminalIssueId === issue.id ? issueSummary ?? issue : null);
+        // An issue with no live blocker edge must still surface on the board
+        // (hiding it strands it silently), but it must never be recorded as its
+        // own terminal blocker. The old `?? issue.id` fallback did exactly that,
+        // producing a phantom self-block: agents skip it (looks blocked) and the
+        // unstick watchdog skips it (looks covered). 13 such issues wedged the
+        // AGE board, including the GA chain. The edge-level self-block invariant
+        // in syncBlockedByIssueIds cannot catch these — no edge row exists at
+        // all; the cycle is invented here, in the derived view. So: keep the row,
+        // drop the self-reference, and let blockingIssue resolve to null.
+        const rawTerminalId = blockerAttention.terminalBlockerIssueId;
+        const terminalIssueId = rawTerminalId && rawTerminalId !== issue.id ? rawTerminalId : issue.id;
+        const isSelfTerminal = terminalIssueId === issue.id;
+        const terminalSummary = isSelfTerminal
+          ? issueSummary ?? issue
+          : terminalBlockerSummaries.get(terminalIssueId) ?? null;
         if (!terminalSummary) continue;
         const current = terminalCandidates.get(terminalIssueId);
         if (!current || issue.updatedAt > current.issue.updatedAt) {

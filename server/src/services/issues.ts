@@ -7701,6 +7701,28 @@ export function issueService(db: Db) {
         updatedAt: new Date(),
       };
       if (existing.status !== "blocked" && issueData.status === "blocked") {
+        // Fail closed: `blocked` means "waiting on another issue". Without at
+        // least one blocker edge the issue is unreachable — agents skip it (it
+        // looks blocked) and the unstick watchdog skips it (it looks covered),
+        // so it sits forever. This is the write-side half of the phantom
+        // self-block fix in attention.ts; that one stops the derived view from
+        // inventing a self-cycle, this one stops the state existing at all.
+        const liveBlockers = await dbOrTx
+          .select({ blockerIssueId: issueRelations.issueId })
+          .from(issueRelations)
+          .where(
+            and(
+              eq(issueRelations.companyId, existing.companyId),
+              eq(issueRelations.relatedIssueId, id),
+              eq(issueRelations.type, "blocks"),
+            ),
+          );
+        if (liveBlockers.length === 0) {
+          throw unprocessable(
+            "Issue cannot be set to blocked with no blockers. Add a blocker edge (blockedByIssueIds), or use backlog/in_progress.",
+            { code: "blocked_without_blockers" },
+          );
+        }
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
       } else if (existing.status === "blocked" && issueData.status && issueData.status !== "blocked") {
