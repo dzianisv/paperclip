@@ -254,9 +254,34 @@ import {
 } from "../services/cross-issue-influence-limit.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
-const updateIssueRouteSchema = updateIssueSchema.extend({
+// Assignment aliases callers reach for that this model does not use. The board
+// stores agent assignment in `assigneeAgentId` and human assignment in
+// `assigneeUserId`; a PATCH carrying `assigneeId`/`agentId` used to be silently
+// stripped by Zod's default object semantics, so the request returned 200 while
+// the assignment never persisted. Name them explicitly so the 400 is actionable.
+const ISSUE_ASSIGNEE_ALIAS_HINTS: Record<string, string> = {
+  assigneeId: "Unrecognized key \"assigneeId\". Use \"assigneeAgentId\" to assign an agent or \"assigneeUserId\" to assign a person.",
+  agentId: "Unrecognized key \"agentId\". Use \"assigneeAgentId\" to assign an agent.",
+  assignee_id: "Unrecognized key \"assignee_id\". Use \"assigneeAgentId\" to assign an agent or \"assigneeUserId\" to assign a person.",
+  assignee_agent_id: "Unrecognized key \"assignee_agent_id\". Use \"assigneeAgentId\".",
+  assignee: "Unrecognized key \"assignee\". Use \"assigneeAgentId\" to assign an agent or \"assigneeUserId\" to assign a person.",
+};
+
+// `.strict()` turns an unknown key into a 400 instead of a silent no-op update.
+const updateIssueRouteStrictSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
-});
+}).strict();
+
+// The alias pre-stage runs first so a caller who sent `assigneeId` gets the
+// field-specific hint rather than the generic unrecognized-key error.
+const updateIssueRouteSchema = z.unknown().superRefine((value, ctx) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  for (const [alias, message] of Object.entries(ISSUE_ASSIGNEE_ALIAS_HINTS)) {
+    if (Object.hasOwn(value as Record<string, unknown>, alias)) {
+      ctx.addIssue({ code: "custom", path: [alias], message });
+    }
+  }
+}).pipe(updateIssueRouteStrictSchema);
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
   return (req.get("Prefer") ?? "")
