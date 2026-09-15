@@ -1234,9 +1234,10 @@ describeEmbeddedPostgres("built-in agents", () => {
   // later ensure() (e.g. the original candidate was terminated and a
   // different adapter family now qualifies), carrying forward adapterConfig
   // fields shaped for the old adapter type would pair stale, incompatible
-  // config with the new adapter's schema. That case must reset to {}, same
-  // as a brand-new agent would -- not silently combine mismatched type +
-  // config.
+  // config with the new adapter's schema. That case must drop adapter-specific
+  // fields -- not silently combine mismatched type + config -- while keeping
+  // managed instructions bundle tracking, which reconciliation does not
+  // rewrite when the instruction files on disk are already current.
   it("resets adapterConfig instead of carrying stale fields forward when the borrowed adapterType changes (AGE-607)", async () => {
     const companyId = await seedCompany({ requireApproval: false });
     const codexCandidate = await agentService(db).create(companyId, {
@@ -1252,12 +1253,17 @@ describeEmbeddedPostgres("built-in agents", () => {
 
     const created = await builtIns.ensure(companyId, "reflection-coach");
     expect(created.agent?.adapterType).toBe("codex_local");
+    expect(created.agent?.adapterConfig).toMatchObject({
+      instructionsBundleMode: "managed",
+      instructionsEntryFile: "AGENTS.md",
+    });
+    const afterFirstEnsure = created.agent!.adapterConfig as Record<string, unknown>;
 
     // Simulate a codex_local-specific field landing on adapterConfig while
     // the built-in was still on the codex_local adapter (out-of-band patch
     // or reconciler-managed field tied to that adapter shape).
     await db.update(agents)
-      .set({ adapterConfig: { codexReasoningEffort: "high" } })
+      .set({ adapterConfig: { ...afterFirstEnsure, codexReasoningEffort: "high" } })
       .where(eq(agents.id, created.agentId!));
 
     // The original codex candidate goes away (terminated) and a
@@ -1280,6 +1286,13 @@ describeEmbeddedPostgres("built-in agents", () => {
     // and the claude candidate's own model must not be copied over either.
     expect(reconciled.agent?.adapterConfig).not.toMatchObject({ codexReasoningEffort: "high" });
     expect(reconciled.agent?.adapterConfig).not.toMatchObject({ model: "claude-haiku-4-5" });
+    // Managed instructions bundle tracking survives the adapter change.
+    expect(reconciled.agent?.adapterConfig).toMatchObject({
+      instructionsBundleMode: afterFirstEnsure.instructionsBundleMode,
+      instructionsRootPath: afterFirstEnsure.instructionsRootPath,
+      instructionsEntryFile: afterFirstEnsure.instructionsEntryFile,
+      instructionsFilePath: afterFirstEnsure.instructionsFilePath,
+    });
   });
 
   it("materializes the Summarizer bundle paused on Claude Haiku with a disabled routine", async () => {
